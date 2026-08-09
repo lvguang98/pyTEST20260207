@@ -81,10 +81,10 @@ class Ui_Form(object):
         self.name_pane = QtWidgets.QLineEdit(Form)
         self.name_pane.setGeometry(QtCore.QRect(77, 211, 66, 20))
         self.name_pane.setObjectName("name_pane")
-        self.constuction_plant = QtWidgets.QComboBox(Form)
-        self.constuction_plant.setGeometry(QtCore.QRect(70, 550, 301, 22))
-        self.constuction_plant.setEditable(True)
-        self.constuction_plant.setObjectName("constuction_plant")
+        self.construction_plant = QtWidgets.QComboBox(Form)
+        self.construction_plant.setGeometry(QtCore.QRect(70, 550, 301, 22))
+        self.construction_plant.setEditable(True)
+        self.construction_plant.setObjectName("construction_plant")
         self.label_11 = QtWidgets.QLabel(Form)
         self.label_11.setGeometry(QtCore.QRect(320, 210, 36, 16))
         self.label_11.setObjectName("label_11")
@@ -160,7 +160,7 @@ class Ui_Form(object):
         self.pushButton_7.setObjectName("pushButton_7")
 
         self.retranslateUi(Form)
-        self.pushButton.clicked.connect(Form.work_tlak) # type: ignore
+        self.pushButton.clicked.connect(Form.work_talk) # type: ignore
         self.idnumer_pane.editingFinished.connect(Form.on_id_input_finished) # type: ignore
         self.pushButton_4.clicked.connect(Form.id_clicked) # type: ignore
         self.pushButton_2.clicked.connect(Form.save_company) # type: ignore

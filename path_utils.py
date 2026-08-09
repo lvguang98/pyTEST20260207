@@ -30,7 +30,7 @@ class PathUtils:
         self._setup_user_dirs()
 
         self._initialized = True
-        print(f"✅ PathUtils初始化: app_root={self.app_root}")
+        print(f"[OK] PathUtils初始化: app_root={self.app_root}")
 
     def _determine_app_root(self):
         """确定程序根目录"""

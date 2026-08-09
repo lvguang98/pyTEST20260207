@@ -243,3 +243,99 @@ class AIService:
         except Exception as e:
             print(f"❌ 优化受伤描述失败: {str(e)}")
             return None
+
+    def generate_transcript(self, system_prompt: str, user_prompt: str) -> dict:
+        """
+        调用 DeepSeek API 生成谈话笔录问答内容。
+
+        使用 System + User 双消息格式：
+        - System Prompt 固化法律知识（可被 DeepSeek 缓存，不计入 Token）
+        - User Prompt 传入个案事实（约 300 Token）
+
+        Args:
+            system_prompt: 法律规范的 System Prompt
+            user_prompt: 个案事实的 User Prompt
+
+        Returns:
+            {"状态": "成功"/"失败", "内容": str, "错误信息": str}
+        """
+        try:
+            print(f"📤 准备生成谈话笔录")
+            print(f"   System Prompt 长度: {len(system_prompt)} 字符")
+            print(f"   User Prompt 长度: {len(user_prompt)} 字符")
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 4000,
+                "top_p": 0.9,
+            }
+
+            print(f"🌐 发送请求到: {self.base_url}/chat/completions")
+
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=120  # 生成笔录允许更长的超时
+            )
+
+            print(f"📥 收到响应，状态码: {response.status_code}")
+
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+
+                # 获取 Token 用量信息
+                usage = result.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", 0)
+
+                print(f"✅ 笔录生成成功")
+                print(f"   Prompt Tokens: {prompt_tokens}")
+                print(f"   Completion Tokens: {completion_tokens}")
+                print(f"   Total Tokens: {total_tokens}")
+                print(f"   内容长度: {len(content)} 字符")
+
+                return {
+                    "状态": "成功",
+                    "内容": content.strip(),
+                    "用量": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                    }
+                }
+            else:
+                error_msg = f"API 返回错误 {response.status_code}: {response.text[:300]}"
+                print(f"❌ {error_msg}")
+                return {
+                    "状态": "失败",
+                    "内容": "",
+                    "错误信息": error_msg
+                }
+
+        except requests.exceptions.Timeout:
+            print("⏰ 请求超时（120秒）")
+            return {
+                "状态": "超时",
+                "内容": "",
+                "错误信息": "API请求超时，请检查网络连接后重试"
+            }
+        except Exception as e:
+            print(f"❌ 请求异常: {str(e)}")
+            return {
+                "状态": "异常",
+                "内容": "",
+                "错误信息": f"请求异常: {str(e)}"
+            }

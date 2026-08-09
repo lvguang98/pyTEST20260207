@@ -4,7 +4,7 @@ import datetime
 import logging
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
-from ctypes import *
+from ctypes import windll, byref, create_string_buffer, c_int32, c_uint
 import pandas as pd
 from docx import Document
 from docxtpl import DocxTemplate
@@ -14,8 +14,10 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QMessageBox, QDialog, QVBoxLayout,
     QLabel, QTextEdit, QPushButton, QHBoxLayout, QInputDialog,
     QLineEdit, QComboBox, QCompleter, QCheckBox, QProgressDialog,
-    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup
+    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup,
+    QGroupBox
 )
+from PyQt5.QtGui import QFont
 
 from ui_main_window import Ui_Form
 from file_service import FileService
@@ -25,10 +27,37 @@ from ai_service import AIService
 from config_service import ConfigService
 from path_utils import path_utils
 from case_index import CaseIndexManager, CaseIndexEntry
+from main import UserManager, PasswordLineEdit
 
 # 设置日志级别
 logging.getLogger('config_service').setLevel(logging.WARNING)
 
+
+# ============================================================================
+# 工具函数
+# ============================================================================
+
+def _date_now() -> str:
+    """当前日期，格式：2025年01月01日"""
+    import datetime as _dt
+    return _dt.datetime.now().strftime('%Y年%m月%d日')
+
+
+def _time_now() -> str:
+    """当前时间，格式：14时30分"""
+    import datetime as _dt
+    return _dt.datetime.now().strftime('%H时%M分')
+
+
+def _timestamp_now() -> str:
+    """时间戳，格式：20250101_143000"""
+    import datetime as _dt
+    return _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
+# ============================================================================
+# AIWorker
+# ============================================================================
 
 class AIWorker(QThread):
     """AI工作线程"""
@@ -77,8 +106,8 @@ class CaseDataModel:
             '申请类型': '单位申请'
         })
         self.output_config.update({
-            '当前日期': datetime.datetime.now().strftime('%Y年%m月%d日'),
-            '当前时间': datetime.datetime.now().strftime('%H时%M分')
+            '当前日期': _date_now(),
+            '当前时间': _time_now()
         })
 
     def to_template_dict(self) -> Dict[str, Any]:
@@ -87,8 +116,8 @@ class CaseDataModel:
 
         # 确保日期时间是最新的
         self.output_config.update({
-            '当前日期': datetime.datetime.now().strftime('%Y年%m月%d日'),
-            '当前时间': datetime.datetime.now().strftime('%H时%M分')
+            '当前日期': _date_now(),
+            '当前时间': _time_now()
         })
 
         # 按优先级合并
@@ -138,18 +167,536 @@ class CaseDataModel:
             self.basic_info.pop(key, None)
 
 
+# ============================================================================
+# F2 轮换测试数据集
+# ============================================================================
+TEST_DATA_PRESETS = [
+    # ═══════════════════════════════════════════════════════════════
+    # 案件1: 张三 — 普通工伤(第一项) — 单位申请 — ZZ新城项目
+    # 同案三人: 本人(张三) + 证人(李四) + 法人(王五)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "1/12 张三案-本人谈话",
+        "role": "本人",
+        "name_pane": "张三",
+        "idnumer_pane": "330324199003151234",
+        "textEdit": "浙江省永嘉县瓯北街道XX路88号",
+        "lineEdit_4": "13888880001",
+        "lineEdit_5": "泥水工",
+        "lineEdit_2": "张三",
+        "comboBox": 0,
+        "company_pane": "永嘉县XX建设工程有限公司",
+        "construction_company": "温州YY建筑劳务有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人张三，男，1990年3月15日出生，身份证号330324199003151234，住永嘉县瓯北街道XX路88号。2026年7月20日下午16时20分许，在ZZ新城项目一期工地3号楼5层搬运水泥时，被滑落的水泥袋砸伤右脚，经永嘉县人民医院诊断为右足跖骨骨折。该事故属于在工作时间和工作场所内因工作原因受到的事故伤害，应当认定为工伤。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "医院诊断证明书", "provided": True, "notes": "永嘉县人民医院 右足跖骨骨折"},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+            {"name": "工资银行流水", "provided": False, "notes": ""},
+            {"name": "考勤记录", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "2/12 张三案-证人谈话(李四)",
+        "role": "证人",
+        "name_pane": "李四",
+        "idnumer_pane": "330324198508121235",
+        "textEdit": "浙江省永嘉县桥头镇YY村123号",
+        "lineEdit_4": "13966660002",
+        "lineEdit_5": "钢筋工",
+        "lineEdit_2": "张三",                         # ← 指向同案受伤职工
+        "comboBox": 0,
+        "company_pane": "永嘉县XX建设工程有限公司",
+        "construction_company": "温州YY建筑劳务有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "目击证人李四，与张三同为ZZ新城项目一期工地的工友。2026年7月20日下午16时20分许，李四在3号楼5层作业时，亲眼看到张三搬运水泥袋时水泥袋滑落砸中右脚，张三当场倒地呼痛。李四立即上前查看并通知了班组长。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "证人证言", "provided": True, "notes": ""},
+        ],
+    },
+    {
+        "name": "3/12 张三案-法人谈话(王五)",
+        "role": "法人",
+        "name_pane": "王五",
+        "idnumer_pane": "330324198212011234",
+        "textEdit": "浙江省永嘉县上塘镇XX路66号",
+        "lineEdit_4": "13777770003",
+        "lineEdit_5": "法定代表人",
+        "lineEdit_2": "张三",                         # ← 指向同案受伤职工
+        "comboBox": 0,
+        "company_pane": "永嘉县XX建设工程有限公司",
+        "construction_company": "温州YY建筑劳务有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "永嘉县XX建设工程有限公司法定代表人王五确认：张三系我公司正式职工，于2026年3月1日入职，签订有书面劳动合同。公司未为其参加工伤保险。2026年7月20日下午受伤时，张三正在执行公司安排的正常工作任务。公司认可其受伤属于工伤，愿意配合认定并支付相关费用。",
+        "materials": [
+            {"name": "公司营业执照副本", "provided": True, "notes": ""},
+            {"name": "法定代表人身份证", "provided": True, "notes": ""},
+            {"name": "劳动合同", "provided": True, "notes": "2026年3月1日签订"},
+            {"name": "工资发放记录", "provided": True, "notes": "月薪6000元 银行转账"},
+            {"name": "考勤打卡记录", "provided": True, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件2: 孙七 — 工亡 — 个人申请 — ZZ新城项目
+    # 同案三人: 本人(孙七,已故) + 证人(李四) + 法人(王五)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "4/12 孙七案-本人(工亡)",
+        "role": "本人",
+        "name_pane": "孙七",
+        "idnumer_pane": "330324198704201237",
+        "textEdit": "浙江省永嘉县岩坦镇XX村12号",
+        "lineEdit_4": "13700001111",
+        "lineEdit_5": "钢筋工",
+        "lineEdit_2": "孙七",
+        "comboBox": 0,
+        "company_pane": "永嘉县XX建设工程有限公司",
+        "construction_company": "温州YY建筑劳务有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": True,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "申请人系死者孙七的妻子王九，女，1988年6月出生，身份证号330324198806012345，住永嘉县岩坦镇XX村12号。孙七于2026年8月3日上午9时许，在ZZ新城项目一期工地2号楼进行钢筋绑扎作业时，不慎从8米高处坠落，经抢救无效于当日11时20分死亡。死者生前系永嘉县XX建设工程有限公司钢筋工，月工资8000元。申请人认为孙七在工作中因事故死亡，应当认定为工亡。",
+        "materials": [
+            {"name": "申请人身份证复印件", "provided": True, "notes": "王九 330324198806012345"},
+            {"name": "死者身份证复印件", "provided": True, "notes": "孙七 330324198704201237"},
+            {"name": "死亡证明", "provided": True, "notes": "永嘉县人民医院出具"},
+            {"name": "医院急救记录", "provided": True, "notes": ""},
+            {"name": "婚姻证明", "provided": False, "notes": ""},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+            {"name": "火化证明", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "5/12 孙七案-证人谈话(李四)",
+        "role": "证人",
+        "name_pane": "李四",
+        "idnumer_pane": "330324198508121235",
+        "textEdit": "浙江省永嘉县桥头镇YY村123号",
+        "lineEdit_4": "13966660002",
+        "lineEdit_5": "钢筋工",
+        "lineEdit_2": "孙七",                         # ← 指向同案受伤职工
+        "comboBox": 0,
+        "company_pane": "永嘉县XX建设工程有限公司",
+        "construction_company": "温州YY建筑劳务有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": True,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "目击证人李四，系孙七的同班组工友。2026年8月3日上午9时许，李四与孙七同在ZZ新城项目一期工地2号楼进行钢筋绑扎作业。孙七在8米高的脚手架平台上作业时，因脚下跳板断裂，从高处坠落至地面。李四立即呼救并拨打120，与班组长一起将孙七送往永嘉县人民医院抢救。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "证人证言", "provided": True, "notes": ""},
+        ],
+    },
+    {
+        "name": "6/12 孙七案-法人谈话(王五)",
+        "role": "法人",
+        "name_pane": "王五",
+        "idnumer_pane": "330324198212011234",
+        "textEdit": "浙江省永嘉县上塘镇XX路66号",
+        "lineEdit_4": "13777770003",
+        "lineEdit_5": "法定代表人",
+        "lineEdit_2": "孙七",                         # ← 指向同案受伤职工
+        "comboBox": 0,
+        "company_pane": "永嘉县XX建设工程有限公司",
+        "construction_company": "温州YY建筑劳务有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": True,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "永嘉县XX建设工程有限公司法定代表人王五确认：孙七系我公司正式职工，于2025年6月入职，签订有劳动合同。孙七的具体工作由温州YY建筑劳务有限公司安排管理。2026年8月3日事故发生后，公司已垫付了全部抢救费用共计3.2万元。公司认可孙七因工死亡，愿意配合家属办理工亡认定手续。",
+        "materials": [
+            {"name": "公司营业执照副本", "provided": True, "notes": ""},
+            {"name": "法定代表人身份证", "provided": True, "notes": ""},
+            {"name": "劳动合同", "provided": True, "notes": "2025年6月签订"},
+            {"name": "工资发放记录", "provided": True, "notes": "月薪8000元"},
+            {"name": "考勤打卡记录", "provided": True, "notes": ""},
+            {"name": "医院抢救费用单据", "provided": True, "notes": "合计3.2万元"},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件3: 赵六 — 上下班途中(第六项) — 单位申请
+    # 单人案件: 只有本人
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "7/12 赵六案-本人(上下班途中)",
+        "role": "本人",
+        "name_pane": "赵六",
+        "idnumer_pane": "330324199508031238",
+        "textEdit": "浙江省永嘉县乌牛街道XX小区5栋301室",
+        "lineEdit_4": "13655550004",
+        "lineEdit_5": "装配工",
+        "lineEdit_2": "赵六",
+        "comboBox": 5,
+        "company_pane": "温州BB电器有限公司",
+        "construction_company": "",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人赵六，系温州BB电器有限公司装配工，住永嘉县乌牛街道XX小区5栋301室。2026年8月5日下午17时40分许，申请人下班后骑电动车沿104国道从公司回乌牛街道家中，在104国道乌牛段被一辆小型轿车追尾，经永嘉县交警大队认定对方负全部责任。事故造成申请人左腿胫骨骨折，已送永嘉县人民医院治疗。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "道路交通事故认定书", "provided": True, "notes": "对方全责"},
+            {"name": "医院诊断证明", "provided": True, "notes": "左腿胫骨骨折"},
+            {"name": "劳动合同", "provided": True, "notes": ""},
+            {"name": "路线示意图", "provided": True, "notes": "乌牛街道→104国道→公司"},
+            {"name": "考勤记录", "provided": False, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件4: 刘十 — 预备性工作(第二项) — 单位申请
+    # 同案两人: 本人(刘十) + 证人(钱七)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "8/12 刘十案-本人(预备性工作)",
+        "role": "本人",
+        "name_pane": "刘十",
+        "idnumer_pane": "330324199207052345",
+        "textEdit": "浙江省永嘉县大若岩镇XX村33号",
+        "lineEdit_4": "13511112222",
+        "lineEdit_5": "冲压工",
+        "lineEdit_2": "刘十",
+        "comboBox": 1,
+        "company_pane": "温州AA金属制品有限公司",
+        "construction_company": "",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人刘十，系温州AA金属制品有限公司冲压工。2026年7月25日上午7时40分许（上班时间为8时），申请人按照惯例提前到岗对公司冲压设备进行例行检查和预热，在此过程中右手被机器夹伤，经温州附二医诊断为右手食指和中指挤压伤。该检查和预热工作系申请人职责范围内的预备性工作，应当认定为工伤。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "医院诊断证明", "provided": True, "notes": "右手食指和中指挤压伤"},
+            {"name": "劳动合同", "provided": True, "notes": ""},
+            {"name": "操作规程手册", "provided": True, "notes": "车间设备预热流程"},
+            {"name": "考勤记录", "provided": True, "notes": "7月25日打卡7:35"},
+            {"name": "工资发放记录", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "9/12 刘十案-证人谈话(钱七)",
+        "role": "证人",
+        "name_pane": "钱七",
+        "idnumer_pane": "330324199906081239",
+        "textEdit": "浙江省永嘉县岩头镇ZZ村88号",
+        "lineEdit_4": "13544440005",
+        "lineEdit_5": "冲压工",
+        "lineEdit_2": "刘十",                         # ← 指向同案受伤职工
+        "comboBox": 1,
+        "company_pane": "温州AA金属制品有限公司",
+        "construction_company": "",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "证人钱七，与刘十同为温州AA金属制品有限公司冲压车间工人。2026年7月25日上午约7时40分，钱七刚到车间就看到刘十右手流血被卡在冲压设备中，立即跑过去按下急停按钮并呼叫其他工友帮忙。刘十称是在做设备预热检查时不小心触发了机器。钱七证明该设备每天开工前确实需要预热检查，这是车间一直以来的惯例。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "证人证言", "provided": True, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件5: 周八 — 暴力伤害(第三项) — 个人申请
+    # 单人案件: 只有本人
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "10/12 周八案-本人(暴力伤害)",
+        "role": "本人",
+        "name_pane": "周八",
+        "idnumer_pane": "330324199106011240",
+        "textEdit": "浙江省永嘉县枫林镇XX村55号",
+        "lineEdit_4": "13433330006",
+        "lineEdit_5": "保安",
+        "lineEdit_2": "周八",
+        "comboBox": 2,
+        "company_pane": "温州EE物业管理有限公司",
+        "construction_company": "",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "申请人周八，系温州EE物业管理有限公司保安，派驻永嘉县XX商场担任安保工作。2026年8月1日晚21时许，申请人在商场一楼巡逻时发现一名男子正在盗窃商户商品，上前制止时被对方用随身携带的铁棍击打头部和右臂。商场其他保安闻讯赶来将嫌疑人控制并报警。申请人被送至永嘉县人民医院治疗，诊断为：脑震荡、右臂桡骨骨折。永嘉县公安局已对该盗窃嫌疑人立案侦查。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "医院诊断证明", "provided": True, "notes": "脑震荡、右臂桡骨骨折"},
+            {"name": "公安局报案回执", "provided": True, "notes": "永嘉县公安局"},
+            {"name": "商场监控录像", "provided": True, "notes": "XX商场一楼"},
+            {"name": "保安服务合同", "provided": True, "notes": "温州EE物业→XX商场"},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件6: 钱七 — 因工外出(第五项) — 单位申请
+    # 同案两人: 本人(钱七) + 法人(王五)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "11/12 钱七案-本人(因工外出)",
+        "role": "本人",
+        "name_pane": "钱七",
+        "idnumer_pane": "330324199906081239",
+        "textEdit": "浙江省永嘉县岩头镇ZZ村88号",
+        "lineEdit_4": "13544440005",
+        "lineEdit_5": "技术员",
+        "lineEdit_2": "钱七",
+        "comboBox": 4,
+        "company_pane": "永嘉县CC环保科技有限公司",
+        "construction_company": "",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人钱七，系永嘉县CC环保科技有限公司技术员。2026年7月28日，受公司经理王五指派前往乐清市DD化工厂进行设备维护服务。上午9时30分许，乘坐的公司车辆在乐清市柳市镇境内发生侧翻事故。事故造成申请人腰椎压缩性骨折，已送乐清市人民医院治疗。该公司车辆由公司安排，出差事项有公司派工单和出差申请记录。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "公司派工单", "provided": True, "notes": "2026年7月27日签发"},
+            {"name": "出差申请书", "provided": True, "notes": "经理王五审批"},
+            {"name": "交通事故认定书", "provided": True, "notes": "单方事故 路面湿滑"},
+            {"name": "医院诊断证明", "provided": True, "notes": "腰椎压缩性骨折"},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "12/12 钱七案-法人谈话(王五)",
+        "role": "法人",
+        "name_pane": "王五",
+        "idnumer_pane": "330324198212011234",
+        "textEdit": "浙江省永嘉县上塘镇XX路66号",
+        "lineEdit_4": "13777770003",
+        "lineEdit_5": "经理",
+        "lineEdit_2": "钱七",                         # ← 指向同案受伤职工
+        "comboBox": 4,
+        "company_pane": "永嘉县CC环保科技有限公司",
+        "construction_company": "",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "永嘉县CC环保科技有限公司经理王五确认：钱七系我公司正式技术员，负责对外设备维护服务。2026年7月28日的出差系我本人亲自指派，有派工单和出差审批记录。当日公司安排司机陈某驾驶公司车辆（浙C·XXXXX）送钱七前往乐清市DD化工厂。途中发生的事故由交警认定系路面湿滑导致车辆失控侧翻，系单方事故。公司认可钱七该事故属于因工外出期间受伤。",
+        "materials": [
+            {"name": "公司营业执照副本", "provided": True, "notes": ""},
+            {"name": "经理身份证", "provided": True, "notes": ""},
+            {"name": "派工单", "provided": True, "notes": "2026年7月27日"},
+            {"name": "出差审批单", "provided": True, "notes": ""},
+            {"name": "公司车辆行驶证", "provided": True, "notes": "浙C·XXXXX"},
+            {"name": "劳动合同", "provided": True, "notes": ""},
+        ],
+    },
+]
+
+
+# ============================================================================
+# 关键证据定义（缺失时AI必须在笔录中追问）
+# ============================================================================
+KEY_EVIDENCE_NAMES = [
+    "身份证",           # 身份证明
+    "劳动合同",         # 劳动关系证明
+    "医院诊断证明",     # 受伤事实证明
+    "工资发放记录",     # 工资标准证明
+    "考勤记录",         # 工作时间证明
+    "证人证言",         # 事故见证
+    "事故现场照片",     # 现场证据
+    "监控录像",         # 现场证据
+    "工伤认定书",       # 前置认定
+    "劳动关系裁决书",   # 劳动关系确认
+    "道路交通事故认定书",  # 上下班途中/因工外出
+    "公安报案回执",     # 暴力伤害
+    "死亡证明",         # 工亡
+]
+
+
+# ============================================================================
+# MaterialListWidget — 可勾选+可备注的材料列表组件
+# ============================================================================
+
+class MaterialListWidget(QWidget):
+    """替代原有 QTextEdit 的材料管理组件。
+
+    每行: [☑/☐ 复选框] [材料名称] [备注输入框]
+    - 勾选 = 已提供
+    - 未勾选 = 缺失，生成笔录时AI会追问
+    - 备注 = 对该材料的补充说明
+    """
+
+    materials_changed = pyqtSignal()  # 材料变更信号
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: List[Dict[str, Any]] = []  # [{name, provided, notes, widget_refs}]
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+
+        # 滚动区域
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("""
+            QScrollArea {
+                border: 1px solid #ccc;
+                border-radius: 2px;
+                background-color: #fafafa;
+            }
+        """)
+
+        # 内容容器
+        self._container = QWidget()
+        self._container.setStyleSheet("background-color: #fafafa;")
+        self._row_layout = QVBoxLayout(self._container)
+        self._row_layout.setContentsMargins(4, 2, 4, 2)
+        self._row_layout.setSpacing(2)
+        self._row_layout.addStretch()  # 底部弹簧，把行推到顶部
+
+        self.scroll.setWidget(self._container)
+        layout.addWidget(self.scroll)
+
+    def _make_row(self, name: str = "", provided: bool = False, notes: str = ""):
+        """创建一行材料条目"""
+        row = QWidget()
+        row.setFixedHeight(23)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(3)
+
+        # 复选框
+        cb = QCheckBox()
+        cb.setChecked(provided)
+        cb.setFixedWidth(18)
+        cb.setToolTip("勾选=已提供  |  不勾选=缺失")
+        cb.toggled.connect(self._on_changed)
+
+        # 材料名称输入框（可编辑）
+        name_edit = QLineEdit(name if name else "")
+        name_edit.setPlaceholderText("材料名称...")
+        name_edit.setStyleSheet("""
+            QLineEdit {
+                font-size: 8pt;
+                border: 1px solid #ddd;
+                border-radius: 1px;
+                padding: 1px 3px;
+                background-color: #fff;
+            }
+            QLineEdit:focus {
+                border-color: #3498db;
+            }
+        """)
+        name_edit.setMinimumWidth(100)
+        name_edit.textChanged.connect(self._on_changed)
+
+        # 备注输入框
+        note_edit = QLineEdit()
+        note_edit.setText(notes)
+        note_edit.setPlaceholderText("备注...")
+        note_edit.setStyleSheet(name_edit.styleSheet())
+        note_edit.textChanged.connect(self._on_changed)
+
+        h.addWidget(cb)
+        h.addWidget(name_edit, 1)   # stretch=1，自动填充剩余空间
+        h.addWidget(note_edit, 2)   # stretch=2，备注更宽
+
+        return row, cb, name_edit, note_edit
+
+    def add_row(self, name: str = "", provided: bool = False, notes: str = ""):
+        """在末尾添加一行"""
+        row, cb, name_edit, note = self._make_row(name, provided, notes)
+        # 在 stretch 之前插入
+        self._row_layout.insertWidget(self._row_layout.count() - 1, row)
+
+        item = {
+            "name": name,
+            "provided": provided,
+            "notes": notes,
+            "_cb": cb,
+            "_name_edit": name_edit,
+            "_note": note,
+            "_row": row,
+        }
+        self._rows.append(item)
+
+    def set_materials(self, data: List[Dict[str, Any]]):
+        """批量设置材料列表"""
+        self.clear()
+        for item in data:
+            self.add_row(
+                name=item.get("name", ""),
+                provided=item.get("provided", False),
+                notes=item.get("notes", "")
+            )
+
+    def get_materials(self) -> List[Dict[str, Any]]:
+        """获取所有材料数据（同步UI状态）"""
+        result = []
+        for row in self._rows:
+            result.append({
+                "name": row["_name_edit"].text(),
+                "provided": row["_cb"].isChecked(),
+                "notes": row["_note"].text(),
+            })
+        return result
+
+    def get_provided(self) -> List[str]:
+        """获取已提供的材料名称列表"""
+        return [r["_name_edit"].text() for r in self._rows if r["_cb"].isChecked()]
+
+    def get_missing(self) -> List[str]:
+        """获取缺失的材料名称列表"""
+        return [r["_name_edit"].text() for r in self._rows if not r["_cb"].isChecked()]
+
+    def get_missing_key_evidence(self) -> List[str]:
+        """获取缺失的关键证据列表"""
+        missing = self.get_missing()
+        return [m for m in missing if any(
+            kw in m for kw in KEY_EVIDENCE_NAMES
+        )]
+
+    def clear(self):
+        """清空所有行"""
+        for row in self._rows:
+            row["_row"].setParent(None)
+        self._rows.clear()
+
+    def get_summary_text(self) -> str:
+        """生成可复制的文本摘要"""
+        lines = []
+        for i, r in enumerate(self.get_materials(), 1):
+            status = "✓" if r["provided"] else "✗"
+            line = f"{status} {i}. {r['name']}"
+            if r["notes"]:
+                line += f"（{r['notes']}）"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def copy_to_clipboard(self):
+        """复制材料摘要到剪贴板"""
+        text = self.get_summary_text()
+        QApplication.clipboard().setText(text)
+
+    def _on_changed(self):
+        """复选框或备注变更时发出信号"""
+        self.materials_changed.emit()
+
+
 class MainWindow(QWidget, Ui_Form):
 
-    def __init__(self, username=None, api_config=None, parent=None, *args, **kwargs):
+    def __init__(self, parent=None, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
         self.setupUi(self)
         self._setup_radio_connections()
 
         self.person_transcript_created = False
+        self._test_data_index = -1  # F2 测试数据轮换索引
 
-        # 保存传递过来的参数（不在此处连接按钮）
-        self.username = username
-        self.api_config = api_config
+        # 创建用户管理器并整合API配置UI
+        self.user_manager = UserManager()
+        self._setup_api_config_ui()
+        self._load_saved_user_config()
 
         # 第一步：统一设置所有路径（必须在所有服务初始化之前）
         print("=" * 50)
@@ -181,7 +728,7 @@ class MainWindow(QWidget, Ui_Form):
         # 第六步：初始化数据模型
         self.data_model = CaseDataModel()
         self.var_manager = TemplateVariableManager(self.data_model)
-        self.data_model.output_config['用户名'] = username or '未登录用户'
+        self.data_model.output_config['用户名'] = self._get_current_username()
 
         self.case_index_manager = CaseIndexManager()
 
@@ -189,7 +736,7 @@ class MainWindow(QWidget, Ui_Form):
         self.setup_logging()
 
         # 保持向后兼容
-        self.dict = self.data_model.to_template_dict()
+        self._template_dict = self.data_model.to_template_dict()
         # 使用FileService加载计数器
         self._daily_counter = self.file_service.load_counter()
         self.current_case_folder = None
@@ -212,7 +759,7 @@ class MainWindow(QWidget, Ui_Form):
         # 连接公司相关信号
         self.company_pane.currentTextChanged.connect(self.company)
         self.construction_company.currentTextChanged.connect(self.sync_employer_to_dict)
-        self.constuction_plant.currentTextChanged.connect(self.c_plant)
+        self.construction_plant.currentTextChanged.connect(self.c_plant)
 
         # 初始化案件类型下拉框
         self.comboBox.addItem("《工伤保险条例》第十四条第一款第一项")
@@ -224,9 +771,6 @@ class MainWindow(QWidget, Ui_Form):
 
         # 初始化组合框（必须在 init_combobox_data 之后）
         self.init_comboboxes()
-
-        # 设置测试数据
-        self.setup_test_data()
 
         # 应用UI设置
         self._apply_ui_settings()
@@ -244,7 +788,10 @@ class MainWindow(QWidget, Ui_Form):
         # 谈话通知书按钮连接
         self.pushButton_12.clicked.connect(self.on_pushButton_12_clicked)
 
-        self.pushButton.clicked.disconnect()
+        try:
+            self.pushButton.clicked.disconnect()
+        except TypeError:
+            pass
         self.pushButton.clicked.connect(self.on_talk_button_clicked)
 
         # 初始状态设为可用
@@ -271,7 +818,7 @@ class MainWindow(QWidget, Ui_Form):
                 self.person_transcript_created = True
 
             # 调用原有的谈话笔录生成逻辑
-            self.work_tlak()
+            self.work_talk()
 
             # 如果是本人笔录，禁用按钮
             if current_role == "本人":
@@ -534,32 +1081,6 @@ class MainWindow(QWidget, Ui_Form):
         print(f"✅ 解析结果: 审查结果长度={len(result['审查结果'])}, 问题数量={len(result['缺失问题'])}")
         return result
 
-    def _setup_paths_from_config(self):
-        """从配置服务设置所有路径（简化版）"""
-        try:
-            print("🔍 开始设置路径（简化版）...")
-
-            # 存储路径使用配置服务（path_utils 已确保目录存在）
-            self.BASE_PATH = str(path_utils.get_storage_path())
-
-            # 模板路径直接计算（不依赖配置）
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            self.TEMPLATE_PATH = str(path_utils.get_template_path())  # 直接使用 path_utils
-
-            # 更新其他服务
-            self._update_services_paths()
-
-            # 禁用 ConfigService 的模板路径验证
-            self.config_service.set('system.startup_check_disk_space', False)
-            self.config_service.set('template.base_path', self.TEMPLATE_PATH)
-
-        except Exception as e:
-            print(f"❌ 配置服务异常，使用默认路径: {e}")
-            # 使用更简单的后备路径
-            self.BASE_PATH = str(path_utils.get_storage_path())  # 即使异常也使用 path_utils
-            self.TEMPLATE_PATH = str(path_utils.get_template_path())
-            print(f"✅ 默认路径: {self.BASE_PATH}")
-
     def _reconnect_approval_button(self):
         """重新连接案件审批表按钮 (pushButton_11)"""
         try:
@@ -648,7 +1169,7 @@ class MainWindow(QWidget, Ui_Form):
                     print(f"  ❌ {field}: 未找到")
 
             # 填充缺失字段
-            current_date = datetime.datetime.now().strftime('%Y年%m月%d日')
+            current_date = _date_now()
 
             if '申请时间' not in extracted_data:
                 extracted_data['申请时间'] = current_date
@@ -680,7 +1201,7 @@ class MainWindow(QWidget, Ui_Form):
             traceback.print_exc()
 
             # 返回最小可用数据
-            current_date = datetime.datetime.now().strftime('%Y年%m月%d日')
+            current_date = _date_now()
             return {
                 '公司名称': self.company_pane.currentText().strip() or '未知公司',
                 '职工姓名': self.lineEdit_2.text().strip() or '未知',
@@ -764,7 +1285,7 @@ class MainWindow(QWidget, Ui_Form):
             self._set_status('审批表数据提取成功', 'green')
 
             # 5. 准备模板数据
-            current_date = datetime.datetime.now().strftime('%Y年%m月%d日')
+            current_date = _date_now()
 
             # 使用docxtpl的RichText来设置红色
             from docxtpl import RichText
@@ -777,7 +1298,7 @@ class MainWindow(QWidget, Ui_Form):
                 '受伤经过': extracted_data.get('受伤经过', '详见谈话笔录'),
                 '当前时期': current_date,
                 '当前日期': current_date,
-                '当前时间': datetime.datetime.now().strftime('%H时%M分'),
+                '当前时间': _time_now(),
                 '案本号': self.get_data('案本号', '')
             }
 
@@ -959,17 +1480,283 @@ class MainWindow(QWidget, Ui_Form):
         self.radioButton_3.clicked.connect(self.clear_role_fields)
         print("✅ 单选按钮信号重新连接")
 
+    def _setup_api_config_ui(self):
+        """在窗口顶部创建折叠配置栏，并下移所有现有控件；右侧增加辅助面板"""
+        TOP_BAR_H = 28          # 顶部小横条高度
+        RIGHT_PANEL_X = 478     # 右侧面板起始 x
+        RIGHT_PANEL_W = 382     # 右侧面板宽度
+
+        # --- 1. 调整窗口大小（左侧 470 + 右侧 400 = 870） ---
+        WIN_W, WIN_H = 870, 740
+        self.setMinimumSize(WIN_W, WIN_H)
+        self.setMaximumSize(WIN_W, WIN_H)
+        self.resize(WIN_W, WIN_H)
+
+        # --- 2. 下移所有现有控件（只挪一个薄顶栏的空间） ---
+        for child in self.children():
+            if isinstance(child, QWidget) and child is not self:
+                try:
+                    geo = child.geometry()
+                    child.setGeometry(geo.x(), geo.y() + TOP_BAR_H,
+                                      geo.width(), geo.height())
+                except Exception:
+                    pass
+
+        # ============================================================
+        # 3. 顶部小横条（始终可见）：⚙ 配置 + 状态
+        # ============================================================
+        self.top_bar = QLabel(self)
+        self.top_bar.setGeometry(0, 0, WIN_W, TOP_BAR_H)
+        self.top_bar.setStyleSheet(
+            "background-color: #e8e8e8; border-bottom: 1px solid #ccc;"
+        )
+
+        # 齿轮按钮：展开/收起用户配置
+        self.config_toggle_btn = QPushButton("⚙", self)
+        self.config_toggle_btn.setGeometry(4, 2, 28, 24)
+        self.config_toggle_btn.setToolTip("显示/隐藏用户配置")
+        self.config_toggle_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; font-size: 14px; }"
+            "QPushButton:hover { background-color: #d0d0d0; border-radius: 3px; }"
+        )
+        self.config_toggle_btn.clicked.connect(self._toggle_config_panel)
+
+        # 顶部状态文字
+        self.top_status_label = QLabel("", self)
+        self.top_status_label.setGeometry(37, 4, 430, 20)
+        self.top_status_label.setStyleSheet("color: #888; background: transparent; border: none;")
+
+        # ============================================================
+        # 4. 可折叠的用户配置面板（默认隐藏）
+        # ============================================================
+        self.api_group = QGroupBox("用户配置", self)
+        self.api_group.setGeometry(5, TOP_BAR_H + 2, 460, 84)
+        self.api_group.setFont(QFont("微软雅黑", 9))
+        self.api_group.hide()  # 默认隐藏
+
+        # 第一行：用户名 + API密钥
+        lbl_user = QLabel("用户:", self.api_group)
+        lbl_user.setGeometry(10, 22, 35, 20)
+
+        self.api_user_combo = QComboBox(self.api_group)
+        self.api_user_combo.setEditable(True)
+        self.api_user_combo.setGeometry(45, 20, 140, 22)
+        self.api_user_combo.setPlaceholderText("输入用户名")
+        self.api_user_combo.currentTextChanged.connect(self._on_user_combo_changed)
+
+        lbl_key = QLabel("密钥:", self.api_group)
+        lbl_key.setGeometry(195, 22, 35, 20)
+
+        self.api_key_input = PasswordLineEdit(self.api_group)
+        self.api_key_input.setGeometry(230, 20, 160, 22)
+        self.api_key_input.setPlaceholderText("输入API密钥")
+
+        # 第二行：记住我 + 保存 + 状态
+        self.api_remember_cb = QCheckBox("记住我", self.api_group)
+        self.api_remember_cb.setGeometry(10, 50, 70, 20)
+        self.api_remember_cb.setChecked(True)
+
+        self.api_save_btn = QPushButton("保存配置", self.api_group)
+        self.api_save_btn.setGeometry(80, 48, 70, 23)
+        self.api_save_btn.clicked.connect(self._on_save_api_config)
+
+        self.api_status_label = QLabel("", self.api_group)
+        self.api_status_label.setGeometry(160, 50, 290, 20)
+        self.api_status_label.setStyleSheet("color: #888;")
+
+        # ============================================================
+        # 5. 右侧面板：案件申请陈述（上）
+        # ============================================================
+        STATEMENT_H = 350
+        self.statement_group = QGroupBox("案件申请陈述", self)
+        self.statement_group.setGeometry(RIGHT_PANEL_X, TOP_BAR_H + 3,
+                                         RIGHT_PANEL_W, STATEMENT_H)
+        self.statement_group.setFont(QFont("微软雅黑", 9))
+
+        self.statement_edit = QTextEdit(self.statement_group)
+        self.statement_edit.setGeometry(8, 18, RIGHT_PANEL_W - 16, STATEMENT_H - 50)
+        self.statement_edit.setPlaceholderText("在此输入案件申请陈述...")
+        self.statement_edit.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #ccc;
+                border-radius: 2px;
+                background-color: #fafafa;
+                font-size: 9pt;
+            }
+            QTextEdit:focus {
+                border-color: #3498db;
+                background-color: #fff;
+            }
+        """)
+
+        # 按钮：手动定位，不用 layout（避免和 QGroupBox 冲突）
+        btn_y = STATEMENT_H - 28
+        stmt_copy_btn = QPushButton("复制", self.statement_group)
+        stmt_copy_btn.setGeometry(8, btn_y, 45, 23)
+        stmt_copy_btn.clicked.connect(lambda: self._copy_statement())
+
+        stmt_clear_btn = QPushButton("清空", self.statement_group)
+        stmt_clear_btn.setGeometry(58, btn_y, 45, 23)
+        stmt_clear_btn.clicked.connect(lambda: self.statement_edit.clear())
+
+        # ============================================================
+        # 6. 右侧面板：目前提供的材料分类（下）
+        # ============================================================
+        MATERIAL_H = 235
+        material_top = TOP_BAR_H + STATEMENT_H + 10
+        self.material_group = QGroupBox("目前提供的材料分类", self)
+        self.material_group.setGeometry(RIGHT_PANEL_X, material_top,
+                                        RIGHT_PANEL_W, MATERIAL_H)
+        self.material_group.setFont(QFont("微软雅黑", 9))
+
+        # 用 MaterialListWidget 替换原来的 QTextEdit
+        self.material_list = MaterialListWidget(self.material_group)
+        self.material_list.setGeometry(8, 18, RIGHT_PANEL_W - 16, MATERIAL_H - 50)
+
+        # 按钮：手动定位
+        mat_btn_y = MATERIAL_H - 28
+        mat_copy_btn = QPushButton("复制", self.material_group)
+        mat_copy_btn.setGeometry(8, mat_btn_y, 45, 23)
+        mat_copy_btn.clicked.connect(lambda: self._copy_material())
+
+        mat_clear_btn = QPushButton("清空", self.material_group)
+        mat_clear_btn.setGeometry(58, mat_btn_y, 45, 23)
+        mat_clear_btn.clicked.connect(lambda: self.material_list.clear())
+
+        mat_add_btn = QPushButton("新增", self.material_group)
+        mat_add_btn.setGeometry(108, mat_btn_y, 45, 23)
+        mat_add_btn.clicked.connect(lambda: self.material_list.add_row())
+
+        print("✅ API配置UI已创建")
+
+    def _load_saved_user_config(self):
+        """加载已保存的用户配置到UI"""
+        remembered = self.user_manager.get_remembered_user()
+        if remembered:
+            username = remembered.get("username", "")
+            api_key = remembered.get("api_key", "")
+            # 填充用户下拉列表
+            user_list = self.user_manager.get_user_list()
+            self.api_user_combo.addItems(user_list)
+            if username:
+                idx = self.api_user_combo.findText(username)
+                if idx >= 0:
+                    self.api_user_combo.setCurrentIndex(idx)
+                else:
+                    self.api_user_combo.setCurrentText(username)
+            if api_key:
+                self.api_key_input.setText(api_key)
+            print(f"✅ 已加载记住的用户: {username}")
+        else:
+            # 至少填充用户列表
+            user_list = self.user_manager.get_user_list()
+            self.api_user_combo.addItems(user_list)
+            print("ℹ️ 没有记住的用户")
+
+    def _get_current_username(self) -> str:
+        """获取当前用户名"""
+        if hasattr(self, 'api_user_combo'):
+            return self.api_user_combo.currentText().strip()
+        return "未登录用户"
+
+    def _toggle_config_panel(self):
+        """展开/收起用户配置面板"""
+        visible = self.api_group.isVisible()
+        self.api_group.setVisible(not visible)
+        arrow = "▼" if not visible else "⚙"
+        self.config_toggle_btn.setText(arrow)
+
+    def _update_api_status(self):
+        """更新API状态标签"""
+        if not hasattr(self, 'api_status_label'):
+            return
+        if self.ai_service:
+            self.api_status_label.setText("✅ AI已就绪")
+            self.api_status_label.setStyleSheet("color: green; font-weight: bold;")
+            self.top_status_label.setText("✅ AI已就绪")
+            self.top_status_label.setStyleSheet("color: green; background: transparent; border: none;")
+        else:
+            username = self._get_current_username()
+            if not username or username == "未登录用户":
+                msg = "⚠️ 请配置用户名和API密钥"
+                self.api_status_label.setText(msg)
+                self.api_status_label.setStyleSheet("color: orange;")
+                self.top_status_label.setText(msg)
+                self.top_status_label.setStyleSheet("color: orange; background: transparent; border: none;")
+            else:
+                msg = "⚠️ API密钥未配置，AI功能不可用"
+                self.api_status_label.setText(msg)
+                self.api_status_label.setStyleSheet("color: orange;")
+                self.top_status_label.setText(msg)
+                self.top_status_label.setStyleSheet("color: orange; background: transparent; border: none;")
+
+    def _on_save_api_config(self):
+        """保存API配置"""
+        username = self.api_user_combo.currentText().strip()
+        api_key = self.api_key_input.text().strip()
+        remember = self.api_remember_cb.isChecked()
+
+        if not username:
+            QMessageBox.warning(self, "提示", "请输入用户名")
+            return
+
+        # 保存到UserManager
+        api_url = "https://api.deepseek.com"
+        success = self.user_manager.save_user_config(
+            username=username,
+            api_url=api_url,
+            api_key=api_key,
+            remember_me=remember,
+            service="DeepSeek"
+        )
+
+        if success:
+            # 更新下拉列表
+            if self.api_user_combo.findText(username) < 0:
+                self.api_user_combo.addItem(username)
+                self.api_user_combo.setCurrentText(username)
+
+            # 更新数据模型
+            self.data_model.output_config['用户名'] = username
+
+            # 重新初始化AI服务
+            self.init_ai_service()
+
+            self._set_status(f"配置已保存 - 用户: {username}", "green")
+            print(f"✅ API配置已保存: 用户={username}, 密钥={'已设置' if api_key else '未设置'}")
+        else:
+            QMessageBox.critical(self, "错误", "保存配置失败，请重试")
+
+    def _on_user_combo_changed(self, text):
+        """用户名下拉框变化时自动加载对应的API密钥"""
+        if not text or not text.strip():
+            return
+        username = text.strip()
+        user_data = self.user_manager.users_data.get('users', {}).get(username, {})
+        if user_data:
+            api_key = user_data.get('api_key', '')
+            remember = user_data.get('remember_me', True)
+            self.api_key_input.setText(api_key)
+            self.api_remember_cb.setChecked(remember)
+            if api_key:
+                print(f"✅ 已加载用户 '{username}' 的API配置")
+            else:
+                print(f"ℹ️ 用户 '{username}' 未配置API密钥")
+
     def init_ai_service(self):
-        """初始化AI服务 - 使用传入的API配置（简化版）"""
+        """初始化AI服务 - 从UserManager读取配置"""
         try:
-            # 直接检查传入的api_config
-            if not self.api_config:
-                print("⚠️ 未传入API配置，AI功能将不可用")
+            # 从UserManager获取当前用户的API配置
+            username = self._get_current_username()
+            if not username:
+                print("⚠️ 未找到用户配置，AI功能将不可用")
                 self.ai_service = None
+                self._update_api_status()
                 return
 
-            api_key = self.api_config.get('api_key', '')
-            api_url = self.api_config.get('api_url', 'https://api.deepseek.com')
+            user_data = self.user_manager.users_data.get('users', {}).get(username, {})
+            api_key = user_data.get('api_key', '')
+            api_url = user_data.get('api_url', 'https://api.deepseek.com')
 
             # 检查配置是否完整
             if not api_key or not api_url:
@@ -977,21 +1764,24 @@ class MainWindow(QWidget, Ui_Form):
                 print(f"  API地址: {api_url if api_url else '未设置'}")
                 print(f"  API密钥: {'已设置' if api_key else '未设置'}")
                 self.ai_service = None
+                self._update_api_status()
                 return
 
-            print(f"✅ 使用传入的API配置初始化AI服务")
+            print(f"✅ 使用用户 '{username}' 的API配置初始化AI服务")
             print(f"  API地址: {api_url}")
             print(f"  API密钥前8位: {api_key[:8]}...")
 
             # 创建AI服务实例
             self.ai_service = AIService(api_key, api_url)
             print("✅ AI服务初始化成功")
+            self._update_api_status()
 
         except Exception as e:
             print(f"❌ AI服务初始化失败: {e}")
             import traceback
             traceback.print_exc()
             self.ai_service = None
+            self._update_api_status()
 
     def ai_review_document(self):
         """AI审查文档"""
@@ -1215,7 +2005,21 @@ class MainWindow(QWidget, Ui_Form):
         """复制文本到剪贴板"""
         clipboard = QApplication.clipboard()
         clipboard.setText(text)
-        QMessageBox.information(parent or self, "复制成功", "审查结果已复制到剪贴板")
+        QMessageBox.information(parent or self, "复制成功", "已复制到剪贴板")
+
+    def _copy_statement(self):
+        """复制案件申请陈述"""
+        text = self.statement_edit.toPlainText().strip()
+        if text:
+            self.copy_to_clipboard(text)
+        else:
+            QMessageBox.information(self, "提示", "案件申请陈述为空")
+
+    def _copy_material(self):
+        """复制材料分类"""
+        if hasattr(self, 'material_list'):
+            self.material_list.copy_to_clipboard()
+        QMessageBox.information(self, "提示", "材料列表已复制到剪贴板")
 
     def save_ai_report(self, parsed_result):
         """保存AI审查报告"""
@@ -1224,7 +2028,7 @@ class MainWindow(QWidget, Ui_Form):
             return
 
         person_name = self.get_data('本人姓名', '未知')
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = _timestamp_now()
         filename = f"{person_name}_AI审查报告_{timestamp}.txt"
         filepath = os.path.join(self.current_case_folder, filename)
 
@@ -1298,8 +2102,8 @@ class MainWindow(QWidget, Ui_Form):
                 return
 
             # 5. 准备模板数据
-            current_date = datetime.datetime.now().strftime('%Y年%m月%d日')
-            current_time = datetime.datetime.now().strftime('%H时%M分')
+            current_date = _date_now()
+            current_time = _time_now()
 
             # 获取公司信息
             company_name = extracted_data.get('公司名称', self.company_pane.currentText().strip())
@@ -1370,16 +2174,6 @@ class MainWindow(QWidget, Ui_Form):
             self._set_status(f'生成工伤告知书异常: {str(e)}', 'red')
             QMessageBox.critical(self, "错误", f"生成工伤告知书异常:\n{str(e)}")
 
-    def setup_test_data(self):
-        """设置测试数据"""
-        self.name_pane.setText("张三")
-        self.lineEdit.setText("男")
-        self.age_pane.setText("35")
-        self.idnumer_pane.setText("110101199001011234")
-        self.textEdit.setPlainText("北京市海淀区中关村大街1号")
-        self.lineEdit_4.setText("13800138000")
-        self.lineEdit_5.setText("建筑工人")
-
     def _apply_ui_settings(self):
         """应用UI设置"""
         try:
@@ -1389,13 +2183,7 @@ class MainWindow(QWidget, Ui_Form):
             font = QFont(ui_settings.font_family, ui_settings.font_size)
             self.setFont(font)
 
-            # 设置窗口大小
-            self.resize(ui_settings.window_width, ui_settings.window_height)
-
-            # 应用语言设置（如果有国际化支持）
-            if hasattr(self, 'retranslateUi'):
-                # 重新翻译UI
-                pass
+            # 注意：窗口大小由 _setup_api_config_ui 固定为 870x740，此处不再覆盖
         except Exception as e:
             print(f"⚠️ 应用UI设置失败: {e}")
 
@@ -1605,7 +2393,7 @@ class MainWindow(QWidget, Ui_Form):
 
     def save_construction_plant(self):
         """保存工地名称到Excel"""
-        new_item = self.constuction_plant.currentText().strip()
+        new_item = self.construction_plant.currentText().strip()
         if new_item and new_item not in self.items_list2:
             self.items_list2 = self.file_service.save_to_excel(
                 "",  # 空字符串
@@ -1614,7 +2402,7 @@ class MainWindow(QWidget, Ui_Form):
                 new_item,
                 self.items_list2
             )
-            self.init_combobox(self.constuction_plant, self.items_list2)
+            self.init_combobox(self.construction_plant, self.items_list2)
             print(f"💾 保存工地名称: {new_item}")
 
     def init_combobox(self, combobox, items):
@@ -1674,11 +2462,11 @@ class MainWindow(QWidget, Ui_Form):
         """统一的数据访问方法"""
         model_value = self._get_from_data_model(key)
         if model_value is not None:
-            if key not in self.dict or self.dict[key] != model_value:
-                self.dict[key] = model_value
+            if key not in self._template_dict or self._template_dict[key] != model_value:
+                self._template_dict[key] = model_value
             return model_value
 
-        dict_value = self.dict.get(key)
+        dict_value = self._template_dict.get(key)
         if dict_value is not None:
             return dict_value
 
@@ -1693,7 +2481,7 @@ class MainWindow(QWidget, Ui_Form):
             category = self._detect_data_category(key)
 
         self._store_to_data_model(key, value, category)
-        self.dict[key] = value
+        self._template_dict[key] = value
         self._handle_special_keys(key, value)
 
     def _handle_special_keys(self, key: str, value: Any):
@@ -1702,8 +2490,8 @@ class MainWindow(QWidget, Ui_Form):
             self.lineEdit_2.setText(str(value))
         elif key == "当前时期":
             if not value:
-                current_date = datetime.datetime.now().strftime('%Y年%m月%d日')
-                current_time = datetime.datetime.now().strftime('%H时%M分')
+                current_date = _date_now()
+                current_time = _time_now()
                 self.set_data(key, f"{current_date}{current_time}", 'output')
 
     def _detect_data_category(self, key: str) -> str:
@@ -1729,25 +2517,20 @@ class MainWindow(QWidget, Ui_Form):
             return 'investigation'
 
     def _get_from_data_model(self, key: str) -> Any:
-        """从数据模型的各个部分获取数据"""
+        """从数据模型的各个部分获取数据
+
+        注意：_store_to_data_model 存储时保留完整 key（含角色前缀），
+        此处 first check 即可命中，不需要再去前缀查找。
+        """
         if key in self.data_model.basic_info:
             return self.data_model.basic_info[key]
 
-        role_prefixes = ['本人', '证人', '法人']
-        for prefix in role_prefixes:
-            if key.startswith(prefix):
-                base_key = key[len(prefix):]
-                if base_key in self.data_model.basic_info:
-                    return self.data_model.basic_info[base_key]
-
-        data_categories = [
+        for category in (
             self.data_model.company_info,
             self.data_model.case_info,
             self.data_model.investigation,
             self.data_model.output_config,
-        ]
-
-        for category in data_categories:
+        ):
             if key in category:
                 return category[key]
 
@@ -1785,6 +2568,12 @@ class MainWindow(QWidget, Ui_Form):
                 field.clear()
             elif isinstance(field, QTextEdit):
                 field.clear()
+
+        # 清空右侧辅助面板
+        if hasattr(self, 'statement_edit'):
+            self.statement_edit.clear()
+        if hasattr(self, 'material_list'):
+            self.material_list.clear()
 
         self._set_status('信息提示', 'black', 'label_14')
         self._set_status('信息提示', 'black', 'label_12')
@@ -1972,8 +2761,8 @@ class MainWindow(QWidget, Ui_Form):
                 self.data_model.investigation['事故发生地点'] = basic_info['事故地点']
 
             # 9. 更新日期时间信息
-            current_date = datetime.datetime.now().strftime("%Y年%m月%d日")
-            current_time = datetime.datetime.now().strftime("%H时%M分")
+            current_date = _date_now()
+            current_time = _time_now()
             self.data_model.output_config['当前日期'] = current_date
             self.data_model.output_config['当前时间'] = current_time
 
@@ -2031,7 +2820,7 @@ class MainWindow(QWidget, Ui_Form):
             file_path = os.path.join(self.current_case_folder, file_name)
             word.save(file_path)
 
-            self.dict.update(all_data)
+            self._template_dict.update(all_data)
 
             # 15. 打开文件
             success, message = self.file_service.open_document(file_path)
@@ -2200,8 +2989,8 @@ class MainWindow(QWidget, Ui_Form):
             all_variables['自我介绍内容'] = self_intro
 
             # 更新字典
-            self.dict.clear()
-            self.dict.update(all_variables)
+            self._template_dict.clear()
+            self._template_dict.update(all_variables)
 
             # 创建或获取案件文件夹 - 使用增强版
             if person_name != self.current_person_name or not self.current_case_folder:
@@ -2246,6 +3035,11 @@ class MainWindow(QWidget, Ui_Form):
                 doc = DocxTemplate(temp_template_path)
                 doc.render(all_variables)
                 doc.save(target_path)
+
+                # 如果有 AI 生成的问答内容，插入到文档中
+                if hasattr(self, '_ai_transcript_content') and self._ai_transcript_content:
+                    self._insert_ai_content_into_doc(target_path)
+                    self._ai_transcript_content = ""  # 用完即清
 
                 self._set_status(f'文件保存成功，案本号: {case_number}', 'green')
 
@@ -2382,7 +3176,7 @@ class MainWindow(QWidget, Ui_Form):
         """获取公司相关信息"""
         company_name = self.company_pane.currentText().strip()
         employer = self.construction_company.currentText().strip()
-        site = self.constuction_plant.currentText().strip()
+        site = self.construction_plant.currentText().strip()
 
         if not company_name:
             company_name = self.get_data('公司名称', '')
@@ -2442,8 +3236,8 @@ class MainWindow(QWidget, Ui_Form):
                     value = self.data_model.company_info.get('公司名称', '')
 
                 elif field == '当前时期':
-                    current_date = variables.get('当前日期', datetime.datetime.now().strftime('%Y年%m月%d日'))
-                    current_time = variables.get('当前时间', datetime.datetime.now().strftime('%H时%M分'))
+                    current_date = variables.get('当前日期', _date_now())
+                    current_time = variables.get('当前时间', _time_now())
                     value = f"{current_date}{current_time}"
 
                 if not value:
@@ -2465,11 +3259,11 @@ class MainWindow(QWidget, Ui_Form):
         """初始化所有组合框"""
         self.init_combobox(self.company_pane, self.items_list)
         self.init_combobox(self.construction_company, self.items_list1)
-        self.init_combobox(self.constuction_plant, self.items_list2)
+        self.init_combobox(self.construction_plant, self.items_list2)
 
         self.company_pane.setCurrentIndex(-1)
         self.construction_company.setCurrentIndex(-1)
-        self.constuction_plant.setCurrentIndex(-1)
+        self.construction_plant.setCurrentIndex(-1)
 
     def company(self):
         """更新公司信息"""
@@ -2483,7 +3277,7 @@ class MainWindow(QWidget, Ui_Form):
 
     def c_plant(self):
         """更新工地名称信息"""
-        site_name = self.constuction_plant.currentText().strip()
+        site_name = self.construction_plant.currentText().strip()
         self.set_data('工地名称', site_name, 'company')
 
     def id_clicked(self):
@@ -2505,7 +3299,7 @@ class MainWindow(QWidget, Ui_Form):
             if ret == 65:
                 return
             dll.SDT_ClosePort(port)
-            self.set_data('当前时期', datetime.datetime.now().strftime("%Y年%m月%d日%H时%M分"), 'output')
+            self.set_data('当前时期', _date_now() + _time_now(), 'output')
 
             role = self.get_current_role_type()
             self.process_id(pucCHMsg, role)
@@ -2579,19 +3373,280 @@ class MainWindow(QWidget, Ui_Form):
             import traceback
             traceback.print_exc()
 
-    def work_tlak(self):
+    def work_talk(self):
         """根据当前角色更新信息并保存案件"""
         role = self.get_current_role_type()
         self.update_role_info(role)
+
+        if self.ai_service:
+            # AI 增强模式
+            self._transcript_with_ai(role)
+        else:
+            # 传统模式：直接走模板
+            self.discriminate()
+            self.work_save()
+
+    def _transcript_with_ai(self, role: str):
+        """使用 AI 生成谈话笔录问答内容"""
+        try:
+            # 1. 案件分类
+            from case_classifier import CaseClassifier
+            classifier = CaseClassifier()
+            c = classifier.classify(self)
+            print(classifier.to_summary(c))
+
+            # 2. 构建 Prompt
+            from transcript_prompt import (
+                build_system_prompt, build_user_prompt, OUTPUT_FORMAT_INSTRUCTION
+            )
+            system_prompt = build_system_prompt(c.regulation_index, role)
+
+            # 案件陈述和材料清单（所有角色都传入）
+            case_statement = ""
+            material_summary = ""
+            if hasattr(self, 'statement_edit'):
+                case_statement = self.statement_edit.toPlainText().strip()
+            if hasattr(self, 'material_list'):
+                material_summary = self.material_list.get_summary_text()
+
+            user_prompt = build_user_prompt(
+                c, case_statement=case_statement, material_summary=material_summary
+            ) + "\n" + OUTPUT_FORMAT_INSTRUCTION
+
+            # ============================================================
+            # [DEBUG] 临时调试对话框 — 显示将发送给 AI 的内容
+            # ============================================================
+            if not self._show_debug_dialog(classifier, c, system_prompt, user_prompt):
+                self._set_status('已取消（调试预览）', 'black')
+                return
+
+            # 3. 状态提示
+            self._set_status('正在AI生成谈话笔录...', 'black')
+            QApplication.processEvents()
+
+            # 4. 调用 AI
+            result = self.ai_service.generate_transcript(system_prompt, user_prompt)
+
+            if result.get("状态") == "成功":
+                self._ai_transcript_content = result.get("内容", "")
+                usage = result.get("用量", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", 0)
+                print(f"✅ AI 笔录生成完成: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+                self._set_status(
+                    f'AI生成完成 (prompt:{prompt_tokens} completion:{completion_tokens})',
+                    'green'
+                )
+            else:
+                error_msg = result.get("错误信息", "未知错误")
+                print(f"⚠️ AI 生成失败: {error_msg}")
+                self._set_status(f'AI生成失败: {error_msg[:50]}，使用传统模板', 'orange')
+                self._ai_transcript_content = ""
+
+        except Exception as e:
+            print(f"❌ AI 生成异常: {e}")
+            import traceback
+            traceback.print_exc()
+            self._set_status('AI生成异常，使用传统模板', 'orange')
+            self._ai_transcript_content = ""
+
+        # 5. 继续保存流程（work_save 会检测并使用 AI 内容）
         self.discriminate()
         self.work_save()
+
+    # ── 调试对话框（临时） ──────────────────────────────────────
+
+    def _show_debug_dialog(self, classifier, c, system_prompt: str,
+                           user_prompt: str) -> bool:
+        """
+        [临时调试] 在调用 AI 前展示分类结果 + System Prompt + User Prompt。
+
+        Returns:
+            True  = 用户点击"继续发送AI"
+            False = 用户点击"取消"
+        """
+        from case_classifier import CaseClassifier
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🔍 AI Prompt 预览（调试）")
+        dlg.resize(950, 750)
+        dlg.setMinimumSize(800, 600)
+
+        layout = QVBoxLayout(dlg)
+
+        # ── 标题 ──
+        title = QLabel("📋 以下是将发送给 DeepSeek 的内容")
+        title.setStyleSheet("font-size: 14px; font-weight: bold; padding: 4px;")
+        layout.addWidget(title)
+
+        # ── 页签容器 ──
+        tabs = QTabWidget()
+
+        # --- Tab 1: 案件分类摘要 ---
+        tab1 = QWidget()
+        t1 = QVBoxLayout(tab1)
+        summary = QTextEdit()
+        summary.setReadOnly(True)
+        summary.setFont(QFont("Consolas", 9))
+        summary.setPlainText(classifier.to_summary(c))
+        t1.addWidget(summary)
+        tabs.addTab(tab1, "分类结果")
+
+        # --- Tab 2: System Prompt ---
+        tab2 = QWidget()
+        t2 = QVBoxLayout(tab2)
+        sp = QTextEdit()
+        sp.setReadOnly(True)
+        sp.setFont(QFont("Consolas", 8))
+        sp.setPlainText(system_prompt)
+        t2.addWidget(sp)
+        stats2 = QLabel(f"字符数: {len(system_prompt)}  |  约 {len(system_prompt)//2} Token（可缓存）")
+        stats2.setStyleSheet("color: #888; padding: 2px;")
+        t2.addWidget(stats2)
+        tabs.addTab(tab2, "System Prompt")
+
+        # --- Tab 3: User Prompt ---
+        tab3 = QWidget()
+        t3 = QVBoxLayout(tab3)
+        up = QTextEdit()
+        up.setReadOnly(True)
+        up.setFont(QFont("Consolas", 9))
+        up.setPlainText(user_prompt)
+        t3.addWidget(up)
+        stats3 = QLabel(f"字符数: {len(user_prompt)}  |  约 {len(user_prompt)//2} Token")
+        stats3.setStyleSheet("color: #888; padding: 2px;")
+        t3.addWidget(stats3)
+        tabs.addTab(tab3, "User Prompt")
+
+        # --- Tab 4: 合并（发送内容） ---
+        tab4 = QWidget()
+        t4 = QVBoxLayout(tab4)
+        combined = QTextEdit()
+        combined.setReadOnly(True)
+        combined.setFont(QFont("Consolas", 8))
+        combined.setPlainText(
+            f"=== SYSTEM PROMPT ({len(system_prompt)} 字符) ===\n\n{system_prompt}\n\n"
+            f"=== USER PROMPT ({len(user_prompt)} 字符) ===\n\n{user_prompt}"
+        )
+        t4.addWidget(combined)
+        stats4 = QLabel(
+            f"System: {len(system_prompt)} 字符 (~{len(system_prompt)//2} Token，可缓存)  |  "
+            f"User: {len(user_prompt)} 字符 (~{len(user_prompt)//2} Token)  |  "
+            f"实际消耗约: ~{len(user_prompt)//2} Token"
+        )
+        stats4.setStyleSheet("color: #888; padding: 2px;")
+        t4.addWidget(stats4)
+        tabs.addTab(tab4, "合并预览")
+
+        layout.addWidget(tabs)
+
+        # ── 底部按钮 ──
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        send_btn = QPushButton("发送给 AI →")
+        send_btn.setStyleSheet(
+            "QPushButton { background-color: #3498db; color: white; font-weight: bold; "
+            "padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #2980b9; }"
+        )
+        send_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(send_btn)
+
+        layout.addLayout(btn_layout)
+
+        return dlg.exec_() == QDialog.Accepted
+
+    def _insert_ai_content_into_doc(self, file_path: str):
+        """
+        将 AI 生成的问答内容插入到已渲染的文档中。
+
+        策略：找到文档中第一个"问："段落（Q&A 正文起点的标记），
+        删除从该位置到文档末尾的所有内容，然后插入 AI 生成的问答。
+
+        Args:
+            file_path: 已渲染的 docx 文件路径
+        """
+        try:
+            from docx import Document
+            from docx.oxml.ns import qn
+            from docx.shared import Pt
+
+            ai_text = self._ai_transcript_content
+            if not ai_text:
+                return
+
+            doc = Document(file_path)
+            body = doc.element.body
+
+            # ── 找到第一个"问："段落，并收集要删除的元素 ──
+            elems_to_remove = []
+            found_qa = False
+            for child in list(body):
+                if child.tag == qn('w:p'):
+                    # 提取段落文本
+                    texts = []
+                    for t in child.iter(qn('w:t')):
+                        if t.text:
+                            texts.append(t.text)
+                    para_text = ''.join(texts).strip()
+
+                    if not found_qa and para_text.startswith('问：'):
+                        found_qa = True
+                    if found_qa:
+                        elems_to_remove.append(child)
+
+            # ── 删除旧的 Q&A 段落 ──
+            for elem in elems_to_remove:
+                body.remove(elem)
+
+            print(f"🗑️ 已移除 {len(elems_to_remove)} 个旧 Q&A 段落")
+
+            # ── 插入 AI 生成的问答内容 ──
+            lines = ai_text.strip().split('\n')
+            inserted_count = 0
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                p = doc.add_paragraph()
+
+                if line.startswith('问：'):
+                    # 问题是普通格式
+                    run = p.add_run(line)
+                    run.font.size = Pt(11)
+                elif line.startswith('答：'):
+                    # 回答需要下划线（笔录规范）
+                    run = p.add_run(line)
+                    run.font.size = Pt(11)
+                    run.underline = True
+                else:
+                    # 其他行（可能是续行）
+                    run = p.add_run(line)
+                    run.font.size = Pt(11)
+
+                inserted_count += 1
+
+            doc.save(file_path)
+            print(f"✅ 已插入 {inserted_count} 个 AI 问答段落 → {file_path}")
+
+        except Exception as e:
+            print(f"❌ 插入 AI 内容失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def discriminate(self):
         """生成模板文件路径"""
         number = self.comboBox.currentIndex()
         role = self.get_current_role_type()
         has_construction_company = bool(self.construction_company.currentText())
-        has_constuction_plant = bool(self.constuction_plant.currentText())
+        has_construction_plant = bool(self.construction_plant.currentText())
 
         # 获取案件配置
         is_death_case, is_personal = self.get_current_case_config_tuple()
@@ -2810,6 +3865,110 @@ class MainWindow(QWidget, Ui_Form):
         # 显示成功消息
         QMessageBox.information(self, "关联成功",
                                 f"已关联到案件: {selected_case['case_number']}")
+
+    # ========================================================================
+    # F2 测试数据轮换
+    # ========================================================================
+
+    def keyPressEvent(self, event):
+        """F2 键轮换测试数据"""
+        if event.key() == Qt.Key_F2:
+            self._cycle_test_data()
+        else:
+            super().keyPressEvent(event)
+
+    def _cycle_test_data(self):
+        """按 F2 切换到下一组测试数据"""
+        self._test_data_index = (self._test_data_index + 1) % len(TEST_DATA_PRESETS)
+        data = TEST_DATA_PRESETS[self._test_data_index]
+
+        print(f"\n{'='*50}")
+        print(f"F2 测试数据: {data['name']}")
+        print(f"{'='*50}")
+
+        # ── 角色单选按钮 ──
+        role_map = {"本人": self.radioButton, "证人": self.radioButton_2, "法人": self.radioButton_3}
+        for role_name, btn in role_map.items():
+            btn.setChecked(role_name == data["role"])
+        # 触发角色切换
+        self.clear_role_fields()
+
+        # ── 案例类型复选框 ──
+        self.death_case_checkbox.setChecked(data["deathCaseCheckbox"])
+        self.personal_application_checkbox.setChecked(data["personalApplicationCheckbox"])
+        self.on_case_type_changed()
+
+        # ── 基本信息输入框 ──
+        self.name_pane.setText(data["name_pane"])
+        self.idnumer_pane.setText(data["idnumer_pane"])
+        self.textEdit.setPlainText(data["textEdit"])
+        self.lineEdit_4.setText(data["lineEdit_4"])
+        self.lineEdit_5.setText(data["lineEdit_5"])
+        self.lineEdit_2.setText(data["lineEdit_2"])
+
+        # ── 条例下拉框 ──
+        self.comboBox.setCurrentIndex(data["comboBox"])
+
+        # ── 公司下拉框 ──
+        self._set_combo_or_type(self.company_pane, data["company_pane"])
+        self._set_combo_or_type(self.construction_company, data["construction_company"])
+        self._set_combo_or_type(self.construction_plant, data["construction_plant"])
+
+        # ── 自动计算年龄和性别 ──
+        role = self.get_current_role_type()
+        self.on_id_input_finished()
+
+        # ── 右侧面板（同案沿用） ──
+        # 同一受伤职工 → 沿用上一组的案件陈述和材料分类
+        # 不同受伤职工 → 用新预设数据覆盖
+        current_worker = data.get("lineEdit_2", "")
+        prev_worker = getattr(self, '_prev_injured_worker', None)
+        is_same_case = (prev_worker is not None and current_worker == prev_worker)
+
+        if hasattr(self, 'statement_edit'):
+            if is_same_case:
+                # 同案：保持案件陈述不变，只检查是否为空
+                if not self.statement_edit.toPlainText().strip() and data.get("statement_edit"):
+                    self.statement_edit.setPlainText(data.get("statement_edit", ""))
+                print(f"📋 同案沿用案件陈述（{current_worker}）")
+            else:
+                self.statement_edit.setPlainText(data.get("statement_edit", ""))
+
+        if hasattr(self, 'material_list'):
+            if is_same_case:
+                # 同案：保持材料分类不变
+                if self.material_list.get_materials() == [] and data.get("materials"):
+                    self.material_list.set_materials(data.get("materials", []))
+                print(f"📋 同案沿用材料分类（{current_worker}）")
+            else:
+                self.material_list.set_materials(data.get("materials", []))
+
+        self._prev_injured_worker = current_worker
+
+        # ── 重置案件状态，允许重新生成笔录 ──
+        self.person_transcript_created = False
+        self.pushButton.setEnabled(True)
+        self.pushButton.setStyleSheet("")
+        self.current_case_folder = None
+        self.current_person_name = ""
+
+        # ── 状态提示 ──
+        label = (f"[测试 {self._test_data_index + 1}/{len(TEST_DATA_PRESETS)}] "
+                 f"{data['name']}  |  F2=下一个")
+        self._set_status(label, 'green')
+        print(f"OK 测试数据已填充: {data['name']}")
+
+    def _set_combo_or_type(self, combobox, text):
+        """设置下拉框的值：如果存在则选中，否则直接输入"""
+        if not text:
+            combobox.setCurrentIndex(-1)
+            return
+        idx = combobox.findText(text)
+        if idx >= 0:
+            combobox.setCurrentIndex(idx)
+        else:
+            combobox.setCurrentIndex(-1)
+            combobox.setEditText(text)
 
 
 if __name__ == "__main__":

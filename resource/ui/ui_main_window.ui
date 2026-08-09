@@ -276,7 +276,7 @@
     </rect>
    </property>
   </widget>
-  <widget class="QComboBox" name="constuction_plant">
+  <widget class="QComboBox" name="construction_plant">
    <property name="geometry">
     <rect>
      <x>70</x>
@@ -594,7 +594,7 @@
    <sender>pushButton</sender>
    <signal>clicked()</signal>
    <receiver>Form</receiver>
-   <slot>work_tlak()</slot>
+   <slot>work_talk()</slot>
    <hints>
     <hint type="sourcelabel">
      <x>317</x>
@@ -753,10 +753,10 @@
  </connections>
  <slots>
   <slot>id_clicked()</slot>
-  <slot>work_tlak()</slot>
+  <slot>work_talk()</slot>
   <slot>on_id_input_finished()</slot>
   <slot>company()</slot>
-  <slot>c_compant()</slot>
+  <slot>c_company()</slot>
   <slot>c_plant()</slot>
   <slot>approve()</slot>
   <slot>br_pb()</slot>

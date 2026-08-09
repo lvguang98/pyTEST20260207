@@ -44,7 +44,7 @@ class CaseIndexManager:
 
         # 加载索引
         self.index = self._load_index()
-        print(f"📁 案件索引管理器初始化，当前案件数: {len(self.index.get('cases', {}))}")
+        print(f"[INFO] 案件索引管理器初始化，当前案件数: {len(self.index.get('cases', {}))}")
 
     def _load_index(self) -> Dict[str, Any]:
         """加载索引文件"""
@@ -52,13 +52,13 @@ class CaseIndexManager:
             try:
                 with open(self.index_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    print(f"✅ 加载案件索引，共 {len(data.get('cases', {}))} 个案件")
+                    print(f"[OK] 加载案件索引，共 {len(data.get('cases', {}))} 个案件")
                     return data
             except json.JSONDecodeError as e:
-                print(f"❌ 索引文件损坏，从备份恢复: {e}")
+                print(f"[ERROR] 索引文件损坏，从备份恢复: {e}")
                 return self._restore_from_backup()
             except Exception as e:
-                print(f"❌ 加载索引失败: {e}")
+                print(f"[ERROR] 加载索引失败: {e}")
 
         # 创建新索引
         return {
@@ -88,11 +88,11 @@ class CaseIndexManager:
             with open(self.index_file, 'w', encoding='utf-8') as f:
                 json.dump(self.index, f, ensure_ascii=False, indent=2)
 
-            print(f"💾 案件索引已保存，共 {self.index['total_cases']} 个案件")
+            print(f"[SAVE] 案件索引已保存，共 {self.index['total_cases']} 个案件")
             return True
 
         except Exception as e:
-            print(f"❌ 保存索引失败: {e}")
+            print(f"[ERROR] 保存索引失败: {e}")
             return False
 
     def _create_backup(self):
@@ -115,7 +115,7 @@ class CaseIndexManager:
             backup_files.sort(key=lambda x: x.stat().st_mtime)
             for old_file in backup_files[:-max_backups]:
                 old_file.unlink()
-                print(f"🧹 清理旧备份: {old_file.name}")
+                print(f"[CLEAN] 清理旧备份: {old_file.name}")
 
     def _restore_from_backup(self) -> Dict[str, Any]:
         """从备份恢复"""
@@ -127,7 +127,7 @@ class CaseIndexManager:
 
             try:
                 with open(latest_backup, 'r', encoding='utf-8') as f:
-                    print(f"🔄 从备份恢复索引: {latest_backup.name}")
+                    print(f"[RESTORE] 从备份恢复索引: {latest_backup.name}")
                     return json.load(f)
             except:
                 pass
@@ -151,7 +151,7 @@ class CaseIndexManager:
             case_number = case_dict["case_number"]
 
             if not case_number:
-                print("❌ 案本号不能为空")
+                print("[ERROR] 案本号不能为空")
                 return False
 
             # 添加到索引
@@ -164,14 +164,14 @@ class CaseIndexManager:
             success = self._save_index()
 
             if success:
-                print(f"✅ 案件已添加到索引: {case_number}")
+                print(f"[OK] 案件已添加到索引: {case_number}")
             else:
-                print(f"❌ 案件添加失败: {case_number}")
+                print(f"[ERROR] 案件添加失败: {case_number}")
 
             return success
 
         except Exception as e:
-            print(f"❌ 添加案件到索引失败: {e}")
+            print(f"[ERROR] 添加案件到索引失败: {e}")
             return False
 
     def _update_statistics(self, case_data: Dict[str, Any]):
@@ -253,7 +253,7 @@ class CaseIndexManager:
         if case_number in self.index["cases"]:
             del self.index["cases"][case_number]
             self._save_index()
-            print(f"🗑️ 已从索引移除案件: {case_number}")
+            print(f"[REMOVE] 已从索引移除案件: {case_number}")
             return True
         return False
 
@@ -271,4 +271,4 @@ class CaseIndexManager:
         for case_number in cases_to_remove:
             self.remove_case(case_number)
 
-        print(f"🧹 清理了 {len(cases_to_remove)} 个旧案件索引")
+        print(f"[CLEAN] 清理了 {len(cases_to_remove)} 个旧案件索引")

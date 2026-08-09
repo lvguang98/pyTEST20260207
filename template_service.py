@@ -216,19 +216,19 @@ class TemplateService:
                 template_name = f"{role}谈话笔录（工亡案件）.docx"
         else:
             case_templates = {
-                0: f"{role}谈话笔录（普通案件）.docx",
+                0: f"{role}谈话笔录（普通工伤案件）.docx",
                 1: f"{role}谈话笔录（工作前后案件）.docx",
                 2: f"{role}谈话笔录（暴力伤害案件）.docx",
                 3: f"{role}谈话笔录（患职业病案件）.docx",
                 4: f"{role}谈话笔录（因工外出案件）.docx",
                 5: f"{role}谈话笔录（上下班时案件）.docx"
             }
-            template_name = case_templates.get(case_type, f"{role}谈话笔录（普通案件）.docx")
+            template_name = case_templates.get(case_type, f"{role}谈话笔录（普通工伤案件）.docx")
 
         template_full_path = os.path.join(self.template_base_path, template_name)
 
         if not os.path.exists(template_full_path):
-            default_template = os.path.join(self.template_base_path, f"{role}谈话笔录（普通案件）.docx")
+            default_template = os.path.join(self.template_base_path, f"{role}谈话笔录（普通工伤案件）.docx")
             if os.path.exists(default_template):
                 return default_template
             else:
@@ -262,7 +262,7 @@ class TemplateService:
                 target_run.font.size = source_run.font.size
 
         except Exception as e:
-            print(f"⚠️ 格式复制失败: {e}")
+            print(f"[WARN] 格式复制失败: {e}")
 
     def _insert_introduction_to_doc(self, doc: Document, introduction_text: str):
         """向文档中插入自我介绍"""
