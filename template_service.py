@@ -14,6 +14,11 @@ class TemplateVariableManager:
         self.variables_cache: Dict[str, Any] = {}
         self.introduction_cache: Dict[str, str] = {}
 
+    def clear_cache(self):
+        """清空所有缓存（切换证人/角色等数据变化时调用，避免命中旧数据）"""
+        self.variables_cache.clear()
+        self.introduction_cache.clear()
+
     def get_self_introduction(self, role: str,
                               company: str, employer: str, site: str,
                               name: str, position: str, id_address: str = "") -> str:

@@ -18,6 +18,10 @@ class CaseIndexEntry:
     case_number: str = ""  # 案本号，如：案本-20250127-001
     person_name: str = ""  # 受伤职工姓名
     id_card_last4: str = ""  # 身份证后4位
+    id_card: str = ""  # 本人身份证号（完整）
+    person_gender: str = ""  # 本人性别
+    regulation: str = ""  # 引用条例
+    applicant_name: str = ""  # 申请人名称
     company_name: str = ""  # 公司名称
     case_type: str = ""  # 案件类型（普通/工亡等）
     created_date: str = ""  # 创建日期

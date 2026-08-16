@@ -18,29 +18,21 @@ class FileService:
         self.logger.setLevel(logging.WARNING)
 
     def create_enhanced_case_folder(self, base_path: str, case_info: Dict[str, Any]) -> str:
-        """创建案件文件夹 - 最精简版"""
+        """创建案件文件夹 —— 直接用案本号命名"""
         import os
 
-        # 提取信息
         case_number = case_info['case_number']
-        person_name = case_info['person_name'].strip()  # 只去除首尾空格
-        id_card = case_info.get('id_card', '')
 
-        # 身份证后4位
-        id_last4 = id_card[-4:] if id_card and len(id_card) >= 4 else 'xxxx'
-
-        # 构建文件夹名
-        folder_name = f"{case_number}-{person_name}-{id_last4}"
+        folder_name = case_number
         folder_path = os.path.join(base_path, folder_name)
 
         # 处理重复
         counter = 1
         while os.path.exists(folder_path):
-            folder_name = f"{case_number}-{person_name}-{id_last4}-{counter:02d}"
+            folder_name = f"{case_number}-{counter:02d}"
             folder_path = os.path.join(base_path, folder_name)
             counter += 1
 
-        # 创建并返回
         os.makedirs(folder_path, exist_ok=True)
         return folder_path
 
@@ -166,42 +158,6 @@ class FileService:
         os.makedirs(folder_path, exist_ok=True)
         return folder_path
 
-    def save_counter(self, counter_value):
-        """
-        保存计数器到文件
-        counter_value: 当前计数器值
-        返回：是否成功
-        """
-        counter_file = os.path.join(self.BASE_PATH, 'case_counter.json')
-        try:
-            data = {
-                'date': datetime.datetime.now().strftime("%Y%m%d"),
-                'counter': counter_value
-            }
-            with open(counter_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            print(f"[FileService ERROR] 保存计数器失败: {e}")
-            return False
-
-    def load_counter(self):
-        """
-        从文件加载计数器
-        返回：计数器值
-        """
-        counter_file = os.path.join(self.BASE_PATH, 'case_counter.json')
-        try:
-            if os.path.exists(counter_file):
-                with open(counter_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    current_date = datetime.datetime.now().strftime("%Y%m%d")
-                    if data.get('date') == current_date:
-                        return data.get('counter', 1)
-        except Exception as e:
-            print(f"[FileService ERROR] 加载计数器失败: {e}")
-        return 1
-
     def save_to_excel(self, template_path, excel_filename, column_name, new_item, existing_items):
         """保存到Excel - 使用统一的数据目录"""
         # 使用PathUtils的数据目录
@@ -227,6 +183,57 @@ class FileService:
             print(f"[FileService ERROR] 保存到Excel失败: {str(e)}")
             return existing_items
 
+    def search_cases_fuzzy(self, base_path: str, keyword: str) -> List[Dict[str, Any]]:
+        """根据关键词模糊搜索案件（匹配文件夹名中任意部分）"""
+        import os
+        import re
+        from datetime import datetime
+
+        if not keyword or not keyword.strip():
+            return []
+
+        kw = keyword.strip()
+        matched_cases = []
+
+        for folder_name in os.listdir(base_path):
+            folder_path = os.path.join(base_path, folder_name)
+            if not os.path.isdir(folder_path):
+                continue
+
+            # 模糊匹配：关键词出现在文件夹名的任意位置
+            if kw not in folder_name:
+                continue
+
+            # 解析文件夹名：张三-案本202608111234 或 张三-案本202608111234-01
+            pattern = r'^(.+?)-(案本|工亡)(\d{8})(\d{4})(-\d{2})?$'
+            match = re.match(pattern, folder_name)
+            if match:
+                name_in_folder = match.group(1)
+                case_number = folder_name.rstrip(match.group(5) or '')
+                id_last4 = match.group(4)
+            else:
+                case_number = folder_name
+                name_in_folder = ''
+                id_last4 = ''
+
+            created_time = os.path.getctime(folder_path)
+            created_date = datetime.fromtimestamp(created_time).strftime('%Y-%m-%d')
+            file_count = len([f for f in os.listdir(folder_path) if f.endswith('.docx')])
+
+            matched_cases.append({
+                'folder_name': folder_name,
+                'folder_path': folder_path,
+                'case_number': case_number,
+                'person_name': name_in_folder,
+                'id_last4': id_last4,
+                'created_date': created_date,
+                'file_count': file_count,
+                'has_person': self._check_has_person_record(folder_path, name_in_folder)
+            })
+
+        matched_cases.sort(key=lambda x: x['folder_name'], reverse=True)
+        return matched_cases
+
     def search_cases_by_person_name(self, base_path: str, person_name: str) -> List[Dict[str, Any]]:
         """
         根据姓名搜索案件文件夹
@@ -248,28 +255,24 @@ class FileService:
         search_name = person_name.strip()
         matched_cases = []
 
-        # 遍历所有文件夹
         for folder_name in os.listdir(base_path):
             folder_path = os.path.join(base_path, folder_name)
 
             if not os.path.isdir(folder_path):
                 continue
 
-            # 解析文件夹名格式：案本-20260109-015-张三-1234
-            # 匹配模式：任意字符-任意字符-4位数字-姓名-4位数字
-            pattern = r'^(.+-\d{8}-\d{3,})-(.+?)-(\d{4})(-\d{2})?$'
+            # 解析文件夹名：张三-案本202608111234
+            pattern = r'^(.+?)-(案本|工亡)(\d{8})(\d{4})(-\d{2})?$'
             match = re.match(pattern, folder_name)
 
             if match:
-                case_number, name_in_folder, id_last4, suffix = match.groups()
+                name_in_folder = match.group(1)
 
-                # 精确匹配姓名
                 if name_in_folder == search_name:
-                    # 获取文件夹信息
+                    case_number = folder_name.rstrip(match.group(5) or '')
+                    id_last4 = match.group(4)
                     created_time = os.path.getctime(folder_path)
                     created_date = datetime.fromtimestamp(created_time).strftime('%Y-%m-%d')
-
-                    # 统计文件夹内的文件
                     file_count = len([f for f in os.listdir(folder_path)
                                       if f.endswith('.docx')])
 

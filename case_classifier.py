@@ -217,8 +217,15 @@ class CaseClassifier:
             c.person.position = w.get_data("法人职务", "") or w.lineEdit_5.text().strip()
         else:
             c.person.position = w.get_data(f"{role}岗位", "") or w.lineEdit_5.text().strip()
-        # 受伤职工
-        c.injured_worker_name = w.get_data("本人姓名", "") or w.lineEdit_2.text().strip()
+        # 受伤职工 — 证人和法人不能用 name_pane 作 fallback（那是证人/法人自己的名字）
+        c.injured_worker_name = w.get_data("本人姓名", "")
+        if not c.injured_worker_name and c.role != "本人":
+            # 尝试从案本号中提取（格式：张三-案本20260811001）
+            case_num = w.lineEdit_2.text().strip()
+            if case_num and '-' in case_num:
+                c.injured_worker_name = case_num.split('-')[0]
+        if not c.injured_worker_name:
+            c.injured_worker_name = w.name_pane.text().strip()
 
     def _classify_company(self, c: CaseClassification, w):
         """分类公司信息"""
