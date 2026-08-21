@@ -33,10 +33,10 @@ class PersonInfo:
 @dataclass
 class CompanyInfo:
     """公司信息"""
-    company_name: str = ""        # 主体公司
+    company_name: str = ""        # 用工单位
     employer: str = ""            # 用人单位
     site: str = ""                # 工地名称
-    has_employer: bool = False    # 是否有用人/派遣单位
+    has_employer: bool = False    # 是否有用人单位
     has_site: bool = False        # 是否有明确工地
 
 
@@ -230,7 +230,7 @@ class CaseClassifier:
     def _classify_company(self, c: CaseClassification, w):
         """分类公司信息"""
         info = w.get_company_info()
-        c.company.company_name = info.get("公司名称", "")
+        c.company.company_name = info.get("用工单位", "")
         c.company.employer = info.get("用人单位", "")
         c.company.site = info.get("工地名称", "")
         c.company.has_employer = bool(c.company.employer)
@@ -321,8 +321,8 @@ class CaseClassifier:
             f"        电话: {c.person.phone}",
             f"        岗位/职务: {c.person.position}",
             "-" * 50,
-            f"[公司] 主体: {c.company.company_name or '未填写'}",
-            f"        用人/派遣: {c.company.employer or '无'}",
+            f"[公司] 用工单位: {c.company.company_name or '未填写'}",
+            f"        用人单位: {c.company.employer or '无'}",
             f"        工地: {c.company.site or '无'}",
             "-" * 50,
             f"[事故] 时间: {c.accident.time or '未填写'}",

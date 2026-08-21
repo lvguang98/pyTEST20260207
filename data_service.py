@@ -29,9 +29,9 @@ class DataService:
             errors.extend([f"个人信息: {err}" for err in person_errors])
 
         # 2. 验证公司信息
-        company_name = case_data.get('公司名称', '')
+        company_name = case_data.get('用工单位', '')
         if not company_name:
-            errors.append("公司名称不能为空")
+            errors.append("用工单位不能为空")
 
         # 3. 验证案件信息
         case_number = case_data.get('案本号', '')

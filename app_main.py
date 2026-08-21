@@ -27,7 +27,6 @@ from template_service import TemplateService, TemplateVariableManager
 from ai_service import AIService
 from config_service import ConfigService
 from path_utils import path_utils
-from case_index import CaseIndexManager, CaseIndexEntry
 from main import UserManager, PasswordLineEdit
 
 # 设置日志级别
@@ -77,6 +76,456 @@ def _witness_label(n: int) -> str:
 
 
 # ============================================================================
+# 拟用条例 选项与格式互转
+# ============================================================================
+
+REGULATION_OPTIONS = [
+    "第十四条第（一）项",
+    "第十四条第（二）项",
+    "第十四条第（三）项",
+    "第十四条第（四）项",
+    "第十四条第（五）项",
+    "第十四条第（六）项",
+    "第十四条第（七）项",
+    "第十五条第（一）项",
+    "第十五条第（二）项",
+    "第十五条第（三）项",
+]
+
+# 拟用条例对应的法律要件（存入案件 JSON，供 AI 生成文书时突出关键证据要素）
+REGULATION_ELEMENTS = {
+    "第十四条第（一）项": ["工作时间", "工作场所", "因工作原因受到事故伤害"],
+    "第十四条第（二）项": ["工作时间前后", "工作场所内", "从事与工作有关的预备性或收尾性工作", "受到事故伤害"],
+    "第十四条第（三）项": ["工作时间", "工作场所内", "因履行工作职责", "受到暴力等意外伤害"],
+    "第十四条第（四）项": ["患职业病（须符合国家职业病目录）"],
+    "第十四条第（五）项": ["因工外出期间", "由于工作原因受到伤害 / 发生事故下落不明"],
+    "第十四条第（六）项": ["上下班途中", "非本人主要责任", "交通事故（含轨道交通、客运轮渡、火车事故）"],
+    "第十五条第（一）项": ["工作时间", "工作岗位", "突发疾病死亡 / 48小时内经抢救无效死亡"],
+    "第十五条第（二）项": ["在抢险救灾等维护国家利益、公共利益活动中受到伤害"],
+    "第十五条第（三）项": ["原在军队服役", "因战/因公负伤致残", "已取得革命伤残军人证", "到用人单位后旧伤复发"],
+}
+
+
+def _regulation_elements(short: str) -> list:
+    """返回拟用条例对应的法律要件列表；未知条例（含第十四条第（七）项兜底）返回空列表"""
+    if not short:
+        return []
+    return list(REGULATION_ELEMENTS.get(short.strip(), []))
+
+_REG_CN_DIGITS = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _cn_num_to_int(text: str):
+    """中文数字转整数：一→1，六→6，十四→14，十五→15"""
+    if not text:
+        return None
+    if text in _REG_CN_DIGITS:
+        return _REG_CN_DIGITS[text]
+    if text.startswith("十"):
+        tail = text[1:]
+        return 10 + (_REG_CN_DIGITS.get(tail, 0) if tail else 0)
+    if "十" in text:
+        tens, ones = text.split("十", 1)
+        return _REG_CN_DIGITS.get(tens, 0) * 10 + (_REG_CN_DIGITS.get(ones, 0) if ones else 0)
+    return None
+
+
+_INT_TO_CN = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五",
+              6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
+
+
+def _int_to_cn_num(n) -> str:
+    """整数转中文数字：1→一，6→六，14→十四，15→十五"""
+    if not n:
+        return ""
+    if n <= 10:
+        return _INT_TO_CN[n]
+    if n < 20:
+        tail = n - 10
+        return "十" + (_INT_TO_CN[tail] if tail else "")
+    tens = n // 10
+    ones = n % 10
+    return _INT_TO_CN[tens] + "十" + (_INT_TO_CN[ones] if ones else "")
+
+
+def _regulation_full_to_short(text: str) -> str:
+    """《工伤保险条例》第十四条第一款第一项 → 第十四条第（一）项"""
+    import re
+    if not text:
+        return ""
+    m = re.search(
+        r"第([一二三四五六七八九十]+)条第[一二三四五六七八九十]+款第([一二三四五六七八九十]+)项",
+        text,
+    )
+    if m:
+        return f"第{m.group(1)}条第（{m.group(2)}）项"
+    return text
+
+
+def _regulation_short_to_full(short: str) -> str:
+    """第十四条第（一）项 → 《工伤保险条例》第十四条第一款第一项"""
+    import re
+    if not short:
+        return ""
+    m = re.match(r"^第([一二三四五六七八九十]+)条第（([一二三四五六七八九十]+)）项$", short)
+    if m:
+        art = _cn_num_to_int(m.group(1))
+        item = _cn_num_to_int(m.group(2))
+        if art and item:
+            return f"《工伤保险条例》第{_int_to_cn_num(art)}条第一款第{_int_to_cn_num(item)}项"
+    return short
+
+
+def _filter_provided(materials):
+    """只保留「已提供（勾选）」的材料，转成 {name, notes} 格式"""
+    if not isinstance(materials, list):
+        return []
+    return [
+        {"name": m.get('name', ''), "notes": m.get('notes', '')}
+        for m in materials
+        if isinstance(m, dict) and m.get('provided') and m.get('name')
+    ]
+
+
+def _to_full_materials(provided_materials):
+    """把 JSON 里的 {name, notes} 材料转回界面用的 {name, provided:True, notes}"""
+    if not isinstance(provided_materials, list):
+        return []
+    return [
+        {"name": m.get('name', ''), "provided": True, "notes": m.get('notes', '')}
+        for m in provided_materials
+        if isinstance(m, dict) and m.get('name')
+    ]
+
+
+# ============================================================================
+# F2 测试数据预设（按 F2 轮换）
+# ============================================================================
+
+TEST_DATA_PRESETS = [
+    # ═══════════════════════════════════════════════════════════════
+    # 案件1: 张三 — 普通工伤(第一项) — 单位申请
+    # 同案三人: 本人(张三) + 证人(李四) + 法人(王五)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "1/12 张三案-本人谈话",
+        "role": "本人",
+        "name_pane": "张三",
+        "idnumer_pane": "330324199003151234",
+        "textEdit": "浙江省永嘉县瓯北街道XX路88号",
+        "lineEdit_4": "13888880001",
+        "lineEdit_5": "泥水工",
+        "injured_worker": "张三",
+        "comboBox": 0,
+        "company_pane": "温州YY建筑劳务有限公司",
+        "construction_company": "永嘉县XX建设工程有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人张三，男，1990年3月15日出生，身份证号330324199003151234，住永嘉县瓯北街道XX路88号。2026年7月20日下午16时20分许，在ZZ新城项目一期工地3号楼5层搬运水泥时，被滑落的水泥袋砸伤右脚，经永嘉县人民医院诊断为右足跖骨骨折。该事故属于在工作时间和工作场所内因工作原因受到的事故伤害，应当认定为工伤。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "医院诊断证明书", "provided": True, "notes": "永嘉县人民医院 右足跖骨骨折"},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+            {"name": "工资银行流水", "provided": False, "notes": ""},
+            {"name": "考勤记录", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "2/12 张三案-证人谈话(李四)",
+        "role": "证人",
+        "name_pane": "李四",
+        "idnumer_pane": "330324198508121235",
+        "textEdit": "浙江省永嘉县桥头镇YY村123号",
+        "lineEdit_4": "13966660002",
+        "lineEdit_5": "钢筋工",
+        "injured_worker": "张三",
+        "comboBox": 0,
+        "company_pane": "温州YY建筑劳务有限公司",
+        "construction_company": "永嘉县XX建设工程有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "目击证人李四，与张三同为ZZ新城项目一期工地的工友。2026年7月20日下午16时20分许，李四在3号楼5层作业时，亲眼看到张三搬运水泥袋时水泥袋滑落砸中右脚，张三当场倒地呼痛。李四立即上前查看并通知了班组长。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "证人证言", "provided": True, "notes": ""},
+        ],
+    },
+    {
+        "name": "3/12 张三案-法人谈话(王五)",
+        "role": "法人",
+        "name_pane": "王五",
+        "idnumer_pane": "330324198212011234",
+        "textEdit": "浙江省永嘉县上塘镇XX路66号",
+        "lineEdit_4": "13777770003",
+        "lineEdit_5": "法定代表人",
+        "injured_worker": "张三",
+        "comboBox": 0,
+        "company_pane": "温州YY建筑劳务有限公司",
+        "construction_company": "永嘉县XX建设工程有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "永嘉县XX建设工程有限公司法定代表人王五确认：张三系我公司正式职工，于2026年3月1日入职，签订有书面劳动合同。公司未为其参加工伤保险。2026年7月20日下午受伤时，张三正在执行公司安排的正常工作任务。公司认可其受伤属于工伤，愿意配合认定并支付相关费用。",
+        "materials": [
+            {"name": "公司营业执照副本", "provided": True, "notes": ""},
+            {"name": "法定代表人身份证", "provided": True, "notes": ""},
+            {"name": "劳动合同", "provided": True, "notes": "2026年3月1日签订"},
+            {"name": "工资发放记录", "provided": True, "notes": "月薪6000元 银行转账"},
+            {"name": "考勤打卡记录", "provided": True, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件2: 孙七 — 工亡 — 个人申请
+    # 同案三人: 本人(孙七,已故) + 证人(李四) + 法人(王五)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "4/12 孙七案-本人(工亡)",
+        "role": "本人",
+        "name_pane": "孙七",
+        "idnumer_pane": "330324198704201237",
+        "textEdit": "浙江省永嘉县岩坦镇XX村12号",
+        "lineEdit_4": "13700001111",
+        "lineEdit_5": "钢筋工",
+        "injured_worker": "孙七",
+        "comboBox": 0,
+        "company_pane": "温州YY建筑劳务有限公司",
+        "construction_company": "永嘉县XX建设工程有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": True,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "申请人系死者孙七的妻子王九，女，1988年6月出生，身份证号330324198806012345，住永嘉县岩坦镇XX村12号。孙七于2026年8月3日上午9时许，在ZZ新城项目一期工地2号楼进行钢筋绑扎作业时，不慎从8米高处坠落，经抢救无效于当日11时20分死亡。死者生前系永嘉县XX建设工程有限公司钢筋工，月工资8000元。申请人认为孙七在工作中因事故死亡，应当认定为工亡。",
+        "materials": [
+            {"name": "申请人身份证复印件", "provided": True, "notes": "王九 330324198806012345"},
+            {"name": "死者身份证复印件", "provided": True, "notes": "孙七 330324198704201237"},
+            {"name": "死亡证明", "provided": True, "notes": "永嘉县人民医院出具"},
+            {"name": "医院急救记录", "provided": True, "notes": ""},
+            {"name": "婚姻证明", "provided": False, "notes": ""},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+            {"name": "火化证明", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "5/12 孙七案-证人谈话(李四)",
+        "role": "证人",
+        "name_pane": "李四",
+        "idnumer_pane": "330324198508121235",
+        "textEdit": "浙江省永嘉县桥头镇YY村123号",
+        "lineEdit_4": "13966660002",
+        "lineEdit_5": "钢筋工",
+        "injured_worker": "孙七",
+        "comboBox": 0,
+        "company_pane": "温州YY建筑劳务有限公司",
+        "construction_company": "永嘉县XX建设工程有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": True,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "目击证人李四，系孙七的同班组工友。2026年8月3日上午9时许，李四与孙七同在ZZ新城项目一期工地2号楼进行钢筋绑扎作业。孙七在8米高的脚手架平台上作业时，因脚下跳板断裂，从高处坠落至地面。李四立即呼救并拨打120，与班组长一起将孙七送往永嘉县人民医院抢救。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "证人证言", "provided": True, "notes": ""},
+        ],
+    },
+    {
+        "name": "6/12 孙七案-法人谈话(王五)",
+        "role": "法人",
+        "name_pane": "王五",
+        "idnumer_pane": "330324198212011234",
+        "textEdit": "浙江省永嘉县上塘镇XX路66号",
+        "lineEdit_4": "13777770003",
+        "lineEdit_5": "法定代表人",
+        "injured_worker": "孙七",
+        "comboBox": 0,
+        "company_pane": "温州YY建筑劳务有限公司",
+        "construction_company": "永嘉县XX建设工程有限公司",
+        "construction_plant": "ZZ新城项目一期工地",
+        "deathCaseCheckbox": True,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "永嘉县XX建设工程有限公司法定代表人王五确认：孙七系我公司正式职工，于2025年6月入职，签订有劳动合同。孙七的具体工作由温州YY建筑劳务有限公司安排管理。2026年8月3日事故发生后，公司已垫付了全部抢救费用共计3.2万元。公司认可孙七因工死亡，愿意配合家属办理工亡认定手续。",
+        "materials": [
+            {"name": "公司营业执照副本", "provided": True, "notes": ""},
+            {"name": "法定代表人身份证", "provided": True, "notes": ""},
+            {"name": "劳动合同", "provided": True, "notes": "2025年6月签订"},
+            {"name": "工资发放记录", "provided": True, "notes": "月薪8000元"},
+            {"name": "考勤打卡记录", "provided": True, "notes": ""},
+            {"name": "医院抢救费用单据", "provided": True, "notes": "合计3.2万元"},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件3: 赵六 — 上下班途中(第六项) — 单位申请
+    # 单人案件: 只有本人
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "7/12 赵六案-本人(上下班途中)",
+        "role": "本人",
+        "name_pane": "赵六",
+        "idnumer_pane": "330324199508031238",
+        "textEdit": "浙江省永嘉县乌牛街道XX小区5栋301室",
+        "lineEdit_4": "13655550004",
+        "lineEdit_5": "装配工",
+        "injured_worker": "赵六",
+        "comboBox": 5,
+        "company_pane": "",
+        "construction_company": "温州BB电器有限公司",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人赵六，系温州BB电器有限公司装配工，住永嘉县乌牛街道XX小区5栋301室。2026年8月5日下午17时40分许，申请人下班后骑电动车沿104国道从公司回乌牛街道家中，在104国道乌牛段被一辆小型轿车追尾，经永嘉县交警大队认定对方负全部责任。事故造成申请人左腿胫骨骨折，已送永嘉县人民医院治疗。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "道路交通事故认定书", "provided": True, "notes": "对方全责"},
+            {"name": "医院诊断证明", "provided": True, "notes": "左腿胫骨骨折"},
+            {"name": "劳动合同", "provided": True, "notes": ""},
+            {"name": "路线示意图", "provided": True, "notes": "乌牛街道→104国道→公司"},
+            {"name": "考勤记录", "provided": False, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件4: 刘十 — 预备性工作(第二项) — 单位申请
+    # 同案两人: 本人(刘十) + 证人(钱七)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "8/12 刘十案-本人(预备性工作)",
+        "role": "本人",
+        "name_pane": "刘十",
+        "idnumer_pane": "330324199207052345",
+        "textEdit": "浙江省永嘉县大若岩镇XX村33号",
+        "lineEdit_4": "13511112222",
+        "lineEdit_5": "冲压工",
+        "injured_worker": "刘十",
+        "comboBox": 1,
+        "company_pane": "",
+        "construction_company": "温州AA金属制品有限公司",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人刘十，系温州AA金属制品有限公司冲压工。2026年7月25日上午7时40分许（上班时间为8时），申请人按照惯例提前到岗对公司冲压设备进行例行检查和预热，在此过程中右手被机器夹伤，经温州附二医诊断为右手食指和中指挤压伤。该检查和预热工作系申请人职责范围内的预备性工作，应当认定为工伤。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "医院诊断证明", "provided": True, "notes": "右手食指和中指挤压伤"},
+            {"name": "劳动合同", "provided": True, "notes": ""},
+            {"name": "操作规程手册", "provided": True, "notes": "车间设备预热流程"},
+            {"name": "考勤记录", "provided": True, "notes": "7月25日打卡7:35"},
+            {"name": "工资发放记录", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "9/12 刘十案-证人谈话(钱七)",
+        "role": "证人",
+        "name_pane": "钱七",
+        "idnumer_pane": "330324199906081239",
+        "textEdit": "浙江省永嘉县岩头镇ZZ村88号",
+        "lineEdit_4": "13544440005",
+        "lineEdit_5": "冲压工",
+        "injured_worker": "刘十",
+        "comboBox": 1,
+        "company_pane": "",
+        "construction_company": "温州AA金属制品有限公司",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "证人钱七，与刘十同为温州AA金属制品有限公司冲压车间工人。2026年7月25日上午约7时40分，钱七刚到车间就看到刘十右手流血被卡在冲压设备中，立即跑过去按下急停按钮并呼叫其他工友帮忙。刘十称是在做设备预热检查时不小心触发了机器。钱七证明该设备每天开工前确实需要预热检查，这是车间一直以来的惯例。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "证人证言", "provided": True, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件5: 周八 — 暴力伤害(第三项) — 个人申请
+    # 单人案件: 只有本人
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "10/12 周八案-本人(暴力伤害)",
+        "role": "本人",
+        "name_pane": "周八",
+        "idnumer_pane": "330324199106011240",
+        "textEdit": "浙江省永嘉县枫林镇XX村55号",
+        "lineEdit_4": "13433330006",
+        "lineEdit_5": "保安",
+        "injured_worker": "周八",
+        "comboBox": 2,
+        "company_pane": "",
+        "construction_company": "温州EE物业管理有限公司",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": True,
+        "statement_edit": "申请人周八，系温州EE物业管理有限公司保安，派驻永嘉县XX商场担任安保工作。2026年8月1日晚21时许，申请人在商场一楼巡逻时发现一名男子正在盗窃商户商品，上前制止时被对方用随身携带的铁棍击打头部和右臂。商场其他保安闻讯赶来将嫌疑人控制并报警。申请人被送至永嘉县人民医院治疗，诊断为：脑震荡、右臂桡骨骨折。永嘉县公安局已对该盗窃嫌疑人立案侦查。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "医院诊断证明", "provided": True, "notes": "脑震荡、右臂桡骨骨折"},
+            {"name": "公安局报案回执", "provided": True, "notes": "永嘉县公安局"},
+            {"name": "商场监控录像", "provided": True, "notes": "XX商场一楼"},
+            {"name": "保安服务合同", "provided": True, "notes": "温州EE物业→XX商场"},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+        ],
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 案件6: 钱七 — 因工外出(第五项) — 单位申请
+    # 同案两人: 本人(钱七) + 法人(王五)
+    # ═══════════════════════════════════════════════════════════════
+    {
+        "name": "11/12 钱七案-本人(因工外出)",
+        "role": "本人",
+        "name_pane": "钱七",
+        "idnumer_pane": "330324199906081239",
+        "textEdit": "浙江省永嘉县岩头镇ZZ村88号",
+        "lineEdit_4": "13544440005",
+        "lineEdit_5": "技术员",
+        "injured_worker": "钱七",
+        "comboBox": 4,
+        "company_pane": "",
+        "construction_company": "永嘉县CC环保科技有限公司",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "申请人钱七，系永嘉县CC环保科技有限公司技术员。2026年7月28日，受公司经理王五指派前往乐清市DD化工厂进行设备维护服务。上午9时30分许，乘坐的公司车辆在乐清市柳市镇境内发生侧翻事故。事故造成申请人腰椎压缩性骨折，已送乐清市人民医院治疗。该公司车辆由公司安排，出差事项有公司派工单和出差申请记录。",
+        "materials": [
+            {"name": "身份证复印件", "provided": True, "notes": ""},
+            {"name": "公司派工单", "provided": True, "notes": "2026年7月27日签发"},
+            {"name": "出差申请书", "provided": True, "notes": "经理王五审批"},
+            {"name": "交通事故认定书", "provided": True, "notes": "单方事故 路面湿滑"},
+            {"name": "医院诊断证明", "provided": True, "notes": "腰椎压缩性骨折"},
+            {"name": "劳动合同", "provided": False, "notes": ""},
+        ],
+    },
+    {
+        "name": "12/12 钱七案-法人谈话(王五)",
+        "role": "法人",
+        "name_pane": "王五",
+        "idnumer_pane": "330324198212011234",
+        "textEdit": "浙江省永嘉县上塘镇XX路66号",
+        "lineEdit_4": "13777770003",
+        "lineEdit_5": "经理",
+        "injured_worker": "钱七",
+        "comboBox": 4,
+        "company_pane": "",
+        "construction_company": "永嘉县CC环保科技有限公司",
+        "construction_plant": "",
+        "deathCaseCheckbox": False,
+        "personalApplicationCheckbox": False,
+        "statement_edit": "永嘉县CC环保科技有限公司经理王五确认：钱七系我公司正式技术员，负责对外设备维护服务。2026年7月28日的出差系我本人亲自指派，有派工单和出差审批记录。当日公司安排司机陈某驾驶公司车辆（浙C·XXXXX）送钱七前往乐清市DD化工厂。途中发生的事故由交警认定系路面湿滑导致车辆失控侧翻，系单方事故。公司认可钱七该事故属于因工外出期间受伤。",
+        "materials": [
+            {"name": "公司营业执照副本", "provided": True, "notes": ""},
+            {"name": "经理身份证", "provided": True, "notes": ""},
+            {"name": "派工单", "provided": True, "notes": "2026年7月27日"},
+            {"name": "出差审批单", "provided": True, "notes": ""},
+            {"name": "公司车辆行驶证", "provided": True, "notes": "浙C·XXXXX"},
+            {"name": "劳动合同", "provided": True, "notes": ""},
+        ],
+    },
+]
+
+
+# ============================================================================
 # AIWorker
 # ============================================================================
 
@@ -106,6 +555,40 @@ class AIWorker(QThread):
             self.progress.emit("分析完成，正在生成报告...", 90)
             self.finished.emit(result)
 
+        except Exception as e:
+            self.error.emit(str(e))
+
+class RegulationAnalyzeWorker(QThread):
+    """条例判断 + 证据分析 的 AI 工作线程"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, ai_service, case_obj):
+        super().__init__()
+        self.ai_service = ai_service
+        self.case_obj = case_obj
+
+    def run(self):
+        try:
+            result = self.ai_service.analyze_case_for_regulation(self.case_obj)
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class TranscriptFromTemplateWorker(QThread):
+    """把「发送给AI的模板」渲染全文发给 AI 生成询问笔录的线程"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, ai_service, full_text):
+        super().__init__()
+        self.ai_service = ai_service
+        self.full_text = full_text
+
+    def run(self):
+        try:
+            result = self.ai_service.generate_transcript_from_text(self.full_text)
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -169,7 +652,7 @@ class CaseDataModel:
                             site: str = ""):
         """更新公司信息"""
         if company_name:
-            self.company_info['公司名称'] = company_name
+            self.company_info['用工单位'] = company_name
         if employer:
             self.company_info['用人单位'] = employer
         if site:
@@ -188,357 +671,6 @@ class CaseDataModel:
 
         for key in keys_to_remove:
             self.basic_info.pop(key, None)
-
-
-# ============================================================================
-# F2 轮换测试数据集
-# ============================================================================
-TEST_DATA_PRESETS = [
-    # ═══════════════════════════════════════════════════════════════
-    # 案件1: 张三 — 普通工伤(第一项) — 单位申请 — ZZ新城项目
-    # 同案五人: 本人(张三) + 证人(李四/陈九/吴十) + 法人(王五)
-    # ═══════════════════════════════════════════════════════════════
-    {
-        "name": "1/14 张三案-本人谈话",
-        "role": "本人",
-        "name_pane": "张三",
-        "idnumer_pane": "330324199003151234",
-        "textEdit": "浙江省永嘉县瓯北街道XX路88号",
-        "lineEdit_4": "13888880001",
-        "lineEdit_5": "泥水工",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "申请人张三，男，1990年3月15日出生，身份证号330324199003151234，住永嘉县瓯北街道XX路88号。2026年7月20日下午16时20分许，在ZZ新城项目一期工地3号楼5层搬运水泥时，被滑落的水泥袋砸伤右脚，经永嘉县人民医院诊断为右足跖骨骨折。该事故属于在工作时间和工作场所内因工作原因受到的事故伤害，应当认定为工伤。",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "医院诊断证明书", "provided": True, "notes": "永嘉县人民医院 右足跖骨骨折"},
-            {"name": "劳动合同", "provided": False, "notes": ""},
-            {"name": "工资银行流水", "provided": False, "notes": ""},
-            {"name": "考勤记录", "provided": False, "notes": ""},
-        ],
-    },
-    {
-        "name": "2/14 张三案-证人谈话(李四)",
-        "role": "证人",
-        "name_pane": "李四",
-        "idnumer_pane": "330324198508121235",
-        "textEdit": "浙江省永嘉县桥头镇YY村123号",
-        "lineEdit_4": "13966660002",
-        "lineEdit_5": "钢筋工",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "证人证言", "provided": True, "notes": ""},
-        ],
-    },
-    {
-        "name": "3/14 张三案-证人谈话(陈九)",
-        "role": "证人",
-        "name_pane": "陈九",
-        "idnumer_pane": "330324198911152041",
-        "textEdit": "浙江省永嘉县桥下镇XX村99号",
-        "lineEdit_4": "13866660007",
-        "lineEdit_5": "木工",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "证人证言", "provided": True, "notes": ""},
-        ],
-    },
-    {
-        "name": "4/14 张三案-证人谈话(吴十)",
-        "role": "证人",
-        "name_pane": "吴十",
-        "idnumer_pane": "330324199204052042",
-        "textEdit": "浙江省永嘉县黄田街道XX村200号",
-        "lineEdit_4": "13788880008",
-        "lineEdit_5": "架子工",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "证人证言", "provided": True, "notes": ""},
-        ],
-    },
-    {
-        "name": "5/14 张三案-法人谈话(王五)",
-        "role": "法人",
-        "name_pane": "王五",
-        "idnumer_pane": "330324198212011234",
-        "textEdit": "浙江省永嘉县上塘镇XX路66号",
-        "lineEdit_4": "13777770003",
-        "lineEdit_5": "法定代表人",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "",
-        "materials": [
-            {"name": "公司营业执照副本", "provided": True, "notes": ""},
-            {"name": "法定代表人身份证", "provided": True, "notes": ""},
-            {"name": "劳动合同", "provided": True, "notes": "2026年3月1日签订"},
-            {"name": "工资发放记录", "provided": True, "notes": "月薪6000元 银行转账"},
-            {"name": "考勤打卡记录", "provided": True, "notes": ""},
-        ],
-    },
-
-    # ═══════════════════════════════════════════════════════════════
-    # 案件2: 孙七 — 工亡 — 个人申请 — ZZ新城项目
-    # 同案三人: 本人(孙七,已故) + 证人(李四) + 法人(王五)
-    # ═══════════════════════════════════════════════════════════════
-    {
-        "name": "6/14 孙七案-本人(工亡)",
-        "role": "本人",
-        "name_pane": "孙七",
-        "idnumer_pane": "330324198704201237",
-        "textEdit": "浙江省永嘉县岩坦镇XX村12号",
-        "lineEdit_4": "13700001111",
-        "lineEdit_5": "钢筋工",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": True,
-        "personalApplicationCheckbox": True,
-        "statement_edit": "申请人系死者孙七的妻子王九，女，1988年6月出生，身份证号330324198806012345，住永嘉县岩坦镇XX村12号。孙七于2026年8月3日上午9时许，在ZZ新城项目一期工地2号楼进行钢筋绑扎作业时，不慎从8米高处坠落，经抢救无效于当日11时20分死亡。死者生前系永嘉县XX建设工程有限公司钢筋工，月工资8000元。申请人认为孙七在工作中因事故死亡，应当认定为工亡。",
-        "materials": [
-            {"name": "申请人身份证复印件", "provided": True, "notes": "王九 330324198806012345"},
-            {"name": "死者身份证复印件", "provided": True, "notes": "孙七 330324198704201237"},
-            {"name": "死亡证明", "provided": True, "notes": "永嘉县人民医院出具"},
-            {"name": "医院急救记录", "provided": True, "notes": ""},
-            {"name": "婚姻证明", "provided": False, "notes": ""},
-            {"name": "劳动合同", "provided": False, "notes": ""},
-            {"name": "火化证明", "provided": False, "notes": ""},
-        ],
-    },
-    {
-        "name": "7/14 孙七案-证人谈话(李四)",
-        "role": "证人",
-        "name_pane": "李四",
-        "idnumer_pane": "330324198508121235",
-        "textEdit": "浙江省永嘉县桥头镇YY村123号",
-        "lineEdit_4": "13966660002",
-        "lineEdit_5": "钢筋工",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": True,
-        "personalApplicationCheckbox": True,
-        "statement_edit": "",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "证人证言", "provided": True, "notes": ""},
-        ],
-    },
-    {
-        "name": "8/14 孙七案-法人谈话(王五)",
-        "role": "法人",
-        "name_pane": "王五",
-        "idnumer_pane": "330324198212011234",
-        "textEdit": "浙江省永嘉县上塘镇XX路66号",
-        "lineEdit_4": "13777770003",
-        "lineEdit_5": "法定代表人",
-        "comboBox": 0,
-        "company_pane": "永嘉县XX建设工程有限公司",
-        "construction_company": "温州YY建筑劳务有限公司",
-        "construction_plant": "ZZ新城项目一期工地",
-        "deathCaseCheckbox": True,
-        "personalApplicationCheckbox": True,
-        "statement_edit": "",
-        "materials": [
-            {"name": "公司营业执照副本", "provided": True, "notes": ""},
-            {"name": "法定代表人身份证", "provided": True, "notes": ""},
-            {"name": "劳动合同", "provided": True, "notes": "2025年6月签订"},
-            {"name": "工资发放记录", "provided": True, "notes": "月薪8000元"},
-            {"name": "考勤打卡记录", "provided": True, "notes": ""},
-            {"name": "医院抢救费用单据", "provided": True, "notes": "合计3.2万元"},
-        ],
-    },
-
-    # ═══════════════════════════════════════════════════════════════
-    # 案件3: 赵六 — 上下班途中(第六项) — 单位申请
-    # 单人案件: 只有本人
-    # ═══════════════════════════════════════════════════════════════
-    {
-        "name": "9/14 赵六案-本人(上下班途中)",
-        "role": "本人",
-        "name_pane": "赵六",
-        "idnumer_pane": "330324199508031238",
-        "textEdit": "浙江省永嘉县乌牛街道XX小区5栋301室",
-        "lineEdit_4": "13655550004",
-        "lineEdit_5": "装配工",
-        "comboBox": 5,
-        "company_pane": "温州BB电器有限公司",
-        "construction_company": "",
-        "construction_plant": "",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "申请人赵六，系温州BB电器有限公司装配工，住永嘉县乌牛街道XX小区5栋301室。2026年8月5日下午17时40分许，申请人下班后骑电动车沿104国道从公司回乌牛街道家中，在104国道乌牛段被一辆小型轿车追尾，经永嘉县交警大队认定对方负全部责任。事故造成申请人左腿胫骨骨折，已送永嘉县人民医院治疗。",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "道路交通事故认定书", "provided": True, "notes": "对方全责"},
-            {"name": "医院诊断证明", "provided": True, "notes": "左腿胫骨骨折"},
-            {"name": "劳动合同", "provided": True, "notes": ""},
-            {"name": "路线示意图", "provided": True, "notes": "乌牛街道→104国道→公司"},
-            {"name": "考勤记录", "provided": False, "notes": ""},
-        ],
-    },
-
-    # ═══════════════════════════════════════════════════════════════
-    # 案件4: 刘十 — 预备性工作(第二项) — 单位申请
-    # 同案两人: 本人(刘十) + 证人(钱七)
-    # ═══════════════════════════════════════════════════════════════
-    {
-        "name": "10/14 刘十案-本人(预备性工作)",
-        "role": "本人",
-        "name_pane": "刘十",
-        "idnumer_pane": "330324199207052345",
-        "textEdit": "浙江省永嘉县大若岩镇XX村33号",
-        "lineEdit_4": "13511112222",
-        "lineEdit_5": "冲压工",
-        "comboBox": 1,
-        "company_pane": "温州AA金属制品有限公司",
-        "construction_company": "",
-        "construction_plant": "",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "申请人刘十，系温州AA金属制品有限公司冲压工。2026年7月25日上午7时40分许（上班时间为8时），申请人按照惯例提前到岗对公司冲压设备进行例行检查和预热，在此过程中右手被机器夹伤，经温州附二医诊断为右手食指和中指挤压伤。该检查和预热工作系申请人职责范围内的预备性工作，应当认定为工伤。",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "医院诊断证明", "provided": True, "notes": "右手食指和中指挤压伤"},
-            {"name": "劳动合同", "provided": True, "notes": ""},
-            {"name": "操作规程手册", "provided": True, "notes": "车间设备预热流程"},
-            {"name": "考勤记录", "provided": True, "notes": "7月25日打卡7:35"},
-            {"name": "工资发放记录", "provided": False, "notes": ""},
-        ],
-    },
-    {
-        "name": "11/14 刘十案-证人谈话(钱七)",
-        "role": "证人",
-        "name_pane": "钱七",
-        "idnumer_pane": "330324199906081239",
-        "textEdit": "浙江省永嘉县岩头镇ZZ村88号",
-        "lineEdit_4": "13544440005",
-        "lineEdit_5": "冲压工",
-        "comboBox": 1,
-        "company_pane": "温州AA金属制品有限公司",
-        "construction_company": "",
-        "construction_plant": "",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "证人证言", "provided": True, "notes": ""},
-        ],
-    },
-
-    # ═══════════════════════════════════════════════════════════════
-    # 案件5: 周八 — 暴力伤害(第三项) — 个人申请
-    # 单人案件: 只有本人
-    # ═══════════════════════════════════════════════════════════════
-    {
-        "name": "12/14 周八案-本人(暴力伤害)",
-        "role": "本人",
-        "name_pane": "周八",
-        "idnumer_pane": "330324199106011240",
-        "textEdit": "浙江省永嘉县枫林镇XX村55号",
-        "lineEdit_4": "13433330006",
-        "lineEdit_5": "保安",
-        "comboBox": 2,
-        "company_pane": "温州EE物业管理有限公司",
-        "construction_company": "",
-        "construction_plant": "",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": True,
-        "statement_edit": "申请人周八，系温州EE物业管理有限公司保安，派驻永嘉县XX商场担任安保工作。2026年8月1日晚21时许，申请人在商场一楼巡逻时发现一名男子正在盗窃商户商品，上前制止时被对方用随身携带的铁棍击打头部和右臂。商场其他保安闻讯赶来将嫌疑人控制并报警。申请人被送至永嘉县人民医院治疗，诊断为：脑震荡、右臂桡骨骨折。永嘉县公安局已对该盗窃嫌疑人立案侦查。",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "医院诊断证明", "provided": True, "notes": "脑震荡、右臂桡骨骨折"},
-            {"name": "公安局报案回执", "provided": True, "notes": "永嘉县公安局"},
-            {"name": "商场监控录像", "provided": True, "notes": "XX商场一楼"},
-            {"name": "保安服务合同", "provided": True, "notes": "温州EE物业→XX商场"},
-            {"name": "劳动合同", "provided": False, "notes": ""},
-        ],
-    },
-
-    # ═══════════════════════════════════════════════════════════════
-    # 案件6: 钱七 — 因工外出(第五项) — 单位申请
-    # 同案两人: 本人(钱七) + 法人(王五)
-    # ═══════════════════════════════════════════════════════════════
-    {
-        "name": "13/14 钱七案-本人(因工外出)",
-        "role": "本人",
-        "name_pane": "钱七",
-        "idnumer_pane": "330324199906081239",
-        "textEdit": "浙江省永嘉县岩头镇ZZ村88号",
-        "lineEdit_4": "13544440005",
-        "lineEdit_5": "技术员",
-        "comboBox": 4,
-        "company_pane": "永嘉县CC环保科技有限公司",
-        "construction_company": "",
-        "construction_plant": "",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "申请人钱七，系永嘉县CC环保科技有限公司技术员。2026年7月28日，受公司经理王五指派前往乐清市DD化工厂进行设备维护服务。上午9时30分许，乘坐的公司车辆在乐清市柳市镇境内发生侧翻事故。事故造成申请人腰椎压缩性骨折，已送乐清市人民医院治疗。该公司车辆由公司安排，出差事项有公司派工单和出差申请记录。",
-        "materials": [
-            {"name": "身份证复印件", "provided": True, "notes": ""},
-            {"name": "公司派工单", "provided": True, "notes": "2026年7月27日签发"},
-            {"name": "出差申请书", "provided": True, "notes": "经理王五审批"},
-            {"name": "交通事故认定书", "provided": True, "notes": "单方事故 路面湿滑"},
-            {"name": "医院诊断证明", "provided": True, "notes": "腰椎压缩性骨折"},
-            {"name": "劳动合同", "provided": False, "notes": ""},
-        ],
-    },
-    {
-        "name": "14/14 钱七案-法人谈话(王五)",
-        "role": "法人",
-        "name_pane": "王五",
-        "idnumer_pane": "330324198212011234",
-        "textEdit": "浙江省永嘉县上塘镇XX路66号",
-        "lineEdit_4": "13777770003",
-        "lineEdit_5": "经理",
-        "comboBox": 4,
-        "company_pane": "永嘉县CC环保科技有限公司",
-        "construction_company": "",
-        "construction_plant": "",
-        "deathCaseCheckbox": False,
-        "personalApplicationCheckbox": False,
-        "statement_edit": "",
-        "materials": [
-            {"name": "公司营业执照副本", "provided": True, "notes": ""},
-            {"name": "经理身份证", "provided": True, "notes": ""},
-            {"name": "派工单", "provided": True, "notes": "2026年7月27日"},
-            {"name": "出差审批单", "provided": True, "notes": ""},
-            {"name": "公司车辆行驶证", "provided": True, "notes": "浙C·XXXXX"},
-            {"name": "劳动合同", "provided": True, "notes": ""},
-        ],
-    },
-]
 
 
 # ============================================================================
@@ -675,8 +807,8 @@ def _build_approval_user_prompt(
         "=" * 50,
         "三、用人单位信息",
         "=" * 50,
-        f"主体公司：{company_info.get('公司名称', '未填写')}",
-        f"用人/派遣单位：{company_info.get('用人单位', '无')}",
+        f"用工单位：{company_info.get('用工单位', '未填写')}",
+        f"用人单位：{company_info.get('用人单位', '无')}",
         f"工地名称：{company_info.get('工地名称', '无')}",
     ])
 
@@ -966,12 +1098,80 @@ class MaterialListWidget(QWidget):
         self.materials_changed.emit()
 
 
+# ============================================================================
+# CaseDataReviewDialog — 数据核对窗口（以 JSON 文本形式显示并可编辑）
+# ============================================================================
+
+class CaseDataReviewDialog(QDialog):
+    """案件数据核对窗口。
+
+    以 JSON 文本形式展示完整案件数据，用户可直接编辑；
+    点击「保存并关闭」时解析 JSON（通过 get_case_obj() 读取），格式错误则提示且不关闭。
+    """
+
+    def __init__(self, case_obj: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self._case_obj: Optional[Dict[str, Any]] = None
+        self._build_ui(case_obj)
+
+    def _build_ui(self, case_obj):
+        self.setWindowTitle("🔍 案件数据核对")
+        self.resize(720, 800)
+        self.setMinimumSize(640, 660)
+
+        root = QVBoxLayout(self)
+
+        title = QLabel("请核对并修改案件数据（JSON 格式），改完后点「保存并关闭」")
+        title.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
+        root.addWidget(title)
+
+        self.json_edit = QTextEdit()
+        self.json_edit.setFont(QFont("Consolas", 10))
+        self.json_edit.setPlainText(json.dumps(case_obj, ensure_ascii=False, indent=2))
+        root.addWidget(self.json_edit, 1)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+
+        save_btn = QPushButton("保存并关闭")
+        save_btn.setStyleSheet(
+            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; "
+            "padding: 6px 24px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #219150; }"
+        )
+        save_btn.clicked.connect(self._on_save)
+        btns.addWidget(save_btn)
+
+        root.addLayout(btns)
+
+    def _on_save(self):
+        text = self.json_edit.toPlainText().strip()
+        try:
+            obj = json.loads(text)
+            if not isinstance(obj, dict):
+                raise ValueError("JSON 顶层必须是对象 {…}")
+            self._case_obj = obj
+            self.accept()
+        except Exception as e:
+            QMessageBox.warning(self, "JSON 格式错误", f"无法解析 JSON：\n{str(e)}\n\n请修正后再保存。")
+
+    def get_case_obj(self) -> Optional[Dict[str, Any]]:
+        return self._case_obj
+
+
 class MainWindow(QWidget, Ui_Form):
 
     def __init__(self, parent=None, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
         self.setupUi(self)
         self._setup_radio_connections()
+
+        self._test_data_index = -1  # F2 测试数据轮换索引
+        self.current_case_id = ""  # 当前案件案本号（跨角色/跨步骤保持同案关联）
 
         # lineEdit_2 改为案本号显示
         self.label_10.setText("案本号：")
@@ -988,8 +1188,6 @@ class MainWindow(QWidget, Ui_Form):
 
         # 输入本人姓名后自动生成案本号
         self.name_pane.editingFinished.connect(self._on_name_pane_changed)
-
-        self._test_data_index = -1  # F2 测试数据轮换索引
 
         # 创建用户管理器并整合API配置UI
         self.user_manager = UserManager()
@@ -1028,8 +1226,6 @@ class MainWindow(QWidget, Ui_Form):
         self.data_model = CaseDataModel()
         self.var_manager = TemplateVariableManager(self.data_model)
         self.data_model.output_config['用户名'] = self._get_current_username()
-
-        self.case_index_manager = CaseIndexManager()
 
         # 简化日志系统
         self.setup_logging()
@@ -1110,13 +1306,804 @@ class MainWindow(QWidget, Ui_Form):
         print("=" * 50)
 
     def on_talk_button_clicked(self):
-        """谈话笔录按钮点击事件处理"""
+        """谈话笔录按钮点击事件处理 — 数据核对 + AI 条例分析"""
         try:
-            self.work_talk()
+            # ── 第一步：弹出数据核对窗口，逐项核对并允许修改 ──
+            if not self.open_data_review():
+                self._set_status('已取消', 'black')
+                return
+
+            # ── 第二步：AI 条例判断 + 证据分析 ──
+            self._analyze_case_with_ai(self.current_case_id)
         except Exception as e:
             print(f"谈话笔录按钮点击异常: {e}")
             import traceback
             traceback.print_exc()
+
+    # ========================================================================
+    # 数据核对（第一步）相关方法
+    # ========================================================================
+
+    def open_data_review(self) -> bool:
+        """弹出案件数据核对窗口（JSON 文本形式）。
+
+        点击时先自动生成案本号填入 case_id；用户可编辑 JSON；
+        保存时解析、落盘并回写主界面。
+        """
+        data, materials, _, _ = self._collect_review_data()
+
+        # ── 点击即自动生成案本号，填入 case_id ──
+        case_id = str(data.get('case_id', '')).strip()
+        if not case_id:
+            case_id = self._auto_generate_case_number(
+                data.get('name', ''), data.get('id_card', '')
+            )
+            data['case_id'] = case_id
+        self.current_case_id = case_id
+
+        case_obj = self._build_case_object(data, materials)
+
+        dlg = CaseDataReviewDialog(case_obj, self)
+        if dlg.exec_() != QDialog.Accepted:
+            self._set_status('已取消数据核对', 'black')
+            return False
+
+        case_obj = dlg.get_case_obj()
+        if not case_obj:
+            return False
+
+        # 以最终 JSON 里的 case_id 为准（用户可能在文本框里改过）
+        case_id = str(case_obj.get('case_id', '')).strip() or case_id
+        case_obj['case_id'] = case_id
+        self.current_case_id = case_id
+
+        # ── 回写主界面与数据模型 ──
+        self._apply_case_object(case_obj)
+
+        # ── 保存到 cases_data.json ──
+        cases = self._load_cases_data()
+        cases[case_id] = case_obj
+        self._save_cases_data(cases)
+
+        self._set_status(f'数据已核对并保存（案本号：{case_id}）', 'green')
+        print(f"✅ 数据核对完成并保存到 cases_data.json（案本号：{case_id}）")
+        return True
+
+    def _collect_review_data(self):
+        """从主界面与数据模型收集当前案件的全部字段（供核对窗口展示）"""
+        # 本人字段以数据模型优先，避免证人/法人切换后 name_pane 串数据
+        regulation_full = self.comboBox.currentText().strip()
+        regulation_short = self.get_data('拟用条例', '') or _regulation_full_to_short(regulation_full)
+
+        data = {
+            'case_id': self.lineEdit_2.text().strip() or self.get_data('案本号', '') or self.current_case_id,
+            'case_nature': '工亡案件' if self.death_case_checkbox.isChecked() else '工伤案件',
+            'applicant_type': '个人申请' if self.personal_application_checkbox.isChecked() else '单位申请',
+            'regulation': regulation_short,
+            'apply_time': self._resolve_date_input(self.apply_time_edit.text()) if hasattr(self, 'apply_time_edit') else '',
+            'accept_time': self._resolve_date_input(self.accept_time_edit.text()) if hasattr(self, 'accept_time_edit') else '',
+            'name': self.get_data('本人姓名', '') or self.name_pane.text().strip(),
+            'gender': self.get_data('本人性别', '') or self.lineEdit.text().strip(),
+            'age': str(self.get_data('本人年龄', '') or self.age_pane.text().strip()),
+            'id_card': self.get_data('本人身份证号', '') or self.idnumer_pane.text().strip(),
+            'phone': self.get_data('本人手机号', '') or self.lineEdit_4.text().strip(),
+            'address': self.get_data('本人身份证地址', '') or self.textEdit.toPlainText().strip(),
+            'position': self.get_data('本人岗位', '') or self.lineEdit_5.text().strip(),
+            'employer': self.get_data('用工单位', '') or self.construction_company.currentText().strip(),
+            'labor_unit': self.get_data('用人单位', '') or self.company_pane.currentText().strip(),
+            'site': self.get_data('工地名称', '') or self.construction_plant.currentText().strip(),
+            'injury_desc': self.statement_edit.toPlainText().strip() if hasattr(self, 'statement_edit')
+                           else self.get_data('受伤经过', ''),
+        }
+        materials = (self.material_list.get_materials() if hasattr(self, 'material_list') else []) \
+            or self.data_model.investigation.get('本人材料', [])
+        witnesses = list(self.data_model.witnesses)
+        legal_reps = self._collect_legal_reps()
+        return data, materials, witnesses, legal_reps
+
+    def _collect_legal_reps(self) -> List[Dict[str, Any]]:
+        """收集法人信息（当前系统法人是单条，通过 法人* 键存储，兼容未来多条）"""
+        name = self.get_data('法人姓名', '')
+        if not name:
+            return []
+        return [{
+            'name': name,
+            'position': self.get_data('法人职务', ''),
+            'id_card': self.get_data('法人身份证号', ''),
+            'address': self.get_data('法人身份证地址', ''),
+            'phone': self.get_data('法人手机号', ''),
+            'materials': self.data_model.investigation.get('法人材料', []),
+        }]
+
+    def _set_combo_or_type(self, combobox, text):
+        """设置下拉框的值：存在则选中，否则输入（可编辑）或新增项（不可编辑）"""
+        text = text or ""
+        if not text:
+            combobox.setCurrentIndex(-1)
+            return
+        idx = combobox.findText(text)
+        if idx >= 0:
+            combobox.setCurrentIndex(idx)
+        elif combobox.isEditable():
+            combobox.setEditText(text)
+        else:
+            combobox.addItem(text)
+            combobox.setCurrentIndex(combobox.count() - 1)
+
+    def _apply_regulation(self, short: str):
+        """把核对后的「拟用条例」写回下拉框与数据模型"""
+        short = (short or "").strip()
+        self.set_data('拟用条例', short, 'case')
+        full = _regulation_short_to_full(short)
+        if full:
+            self.set_data('引用条例', full, 'case')
+            self._set_combo_or_type(self.comboBox, full)
+
+    def _apply_case_object(self, case_obj: Dict[str, Any]):
+        """把核对后的案件 JSON 对象回写到主界面控件与数据模型"""
+        # 案件基本信息
+        self.lineEdit_2.setText(str(case_obj.get('case_id', '')))
+        self.set_data('案本号', case_obj.get('case_id', ''), 'case')
+
+        self.death_case_checkbox.setChecked(case_obj.get('case_nature', '') == '工亡案件')
+        self.personal_application_checkbox.setChecked(case_obj.get('applicant_type', '') == '个人申请')
+        self.on_case_type_changed()
+
+        self._apply_regulation(case_obj.get('proposed_article', ''))
+
+        if hasattr(self, 'apply_time_edit'):
+            self.apply_time_edit.setText(str(case_obj.get('apply_time', '')))
+        if hasattr(self, 'accept_time_edit'):
+            self.accept_time_edit.setText(str(case_obj.get('accept_time', '')))
+        self._save_date_inputs()
+
+        # 本人信息
+        self.name_pane.setText(str(case_obj.get('name', '')))
+        self.set_data('本人姓名', case_obj.get('name', ''), 'basic')
+        self.lineEdit.setText(str(case_obj.get('gender', '')))
+        self.set_data('本人性别', case_obj.get('gender', ''), 'basic')
+        self.age_pane.setText(str(case_obj.get('age', '')))
+        self.set_data('本人年龄', case_obj.get('age', ''), 'basic')
+        self.idnumer_pane.setText(str(case_obj.get('id_card', '')))
+        self.set_data('本人身份证号', case_obj.get('id_card', ''), 'basic')
+        self.lineEdit_4.setText(str(case_obj.get('phone', '')))
+        self.set_data('本人手机号', case_obj.get('phone', ''), 'basic')
+        self.lineEdit_5.setText(str(case_obj.get('position', '')))
+        self.set_data('本人岗位', case_obj.get('position', ''), 'basic')
+        self.textEdit.setPlainText(str(case_obj.get('address', '')))
+        self.set_data('本人身份证地址', case_obj.get('address', ''), 'basic')
+
+        # 单位信息（company_pane=用人单位，construction_company=用工单位）
+        self._set_combo_or_type(self.company_pane, case_obj.get('labor_unit', ''))
+        self.set_data('用人单位', case_obj.get('labor_unit', ''), 'company')
+        self._set_combo_or_type(self.construction_company, case_obj.get('employer', ''))
+        self.set_data('用工单位', case_obj.get('employer', ''), 'company')
+        self._set_combo_or_type(self.construction_plant, case_obj.get('site', ''))
+        self.set_data('工地名称', case_obj.get('site', ''), 'company')
+
+        # 受伤经过
+        if hasattr(self, 'statement_edit'):
+            self.statement_edit.setPlainText(str(case_obj.get('injury_description', '')))
+        self.set_data('受伤经过', case_obj.get('injury_description', ''), 'investigation')
+
+        # 材料清单（本人）—— JSON 里只存了「已提供」，转回界面格式
+        materials_full = _to_full_materials(case_obj.get('materials', []))
+        if hasattr(self, 'material_list'):
+            self.material_list.set_materials(materials_full)
+        self.data_model.investigation['本人材料'] = materials_full
+
+        # 法人信息回写
+        legal_reps = case_obj.get('legal_reps', [])
+        if legal_reps:
+            lr = legal_reps[0]
+            self.set_data('法人姓名', lr.get('name', ''), 'basic')
+            self.set_data('法人职务', lr.get('position', ''), 'basic')
+            self.set_data('法人身份证号', lr.get('id_card', ''), 'basic')
+            self.set_data('法人身份证地址', lr.get('address', ''), 'basic')
+            self.set_data('法人手机号', lr.get('phone', ''), 'basic')
+            self.data_model.investigation['法人材料'] = lr.get('materials', [])
+
+        # 刷新模板字典缓存
+        self._template_dict = self.data_model.to_template_dict()
+        print("✅ 核对数据已回写主界面与数据模型")
+
+    # ========================================================================
+    # 案件 JSON 持久化（案本号为键）
+    # ========================================================================
+
+    def _cases_data_path(self) -> str:
+        """案件数据 JSON 文件路径"""
+        return os.path.join(self.BASE_PATH, 'cases_data.json')
+
+    def _load_cases_data(self) -> Dict[str, Any]:
+        """加载全部案件数据，返回 {case_id: case_obj}"""
+        path = self._cases_data_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get('cases'), dict):
+                return data['cases']
+        except Exception as e:
+            print(f"⚠️ 加载案件数据失败: {e}")
+        return {}
+
+    def _save_cases_data(self, cases: Dict[str, Any]) -> bool:
+        """保存全部案件数据到 cases_data.json"""
+        path = self._cases_data_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({"version": "2.0", "cases": cases}, f, ensure_ascii=False, indent=2)
+            print(f"✅ 案件数据已保存: {path}（共 {len(cases)} 个案件）")
+            return True
+        except Exception as e:
+            print(f"❌ 保存案件数据失败: {e}")
+            return False
+
+    def _update_case_field(self, case_number: str, **fields) -> bool:
+        """把字段写回 cases_data.json 的指定案件"""
+        try:
+            cases = self._load_cases_data()
+            case_obj = cases.get(case_number)
+            if case_obj is None:
+                return False
+            case_obj.update(fields)
+            self._save_cases_data(cases)
+            return True
+        except Exception as e:
+            print(f"⚠️ 更新案件字段失败（非致命）: {e}")
+            return False
+
+    def _build_unified_template_data(self, case_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """构建统一的模板渲染字典。
+
+        中文 key 为主（模板占位符统一用中文），同时附带英文 case_obj 字段名 key，
+        模板里写中文或英文占位符都能被替换。
+        """
+        elements = case_obj.get('proposed_article_elements', []) or []
+        materials = case_obj.get('materials', []) or []
+        material_names = [m.get('name', '') for m in materials
+                          if isinstance(m, dict) and m.get('name')]
+
+        # 统一中文占位符
+        zh = {
+            '案本号': case_obj.get('case_id', ''),
+            '案件性质': case_obj.get('case_nature', ''),
+            '申请类型': case_obj.get('applicant_type', ''),
+            '用工单位': case_obj.get('employer', ''),
+            '用人单位': case_obj.get('labor_unit', ''),
+            '工地名称': case_obj.get('site', ''),
+            '申请时间': case_obj.get('apply_time', ''),
+            '受理时间': case_obj.get('accept_time', ''),
+            '拟用条例': case_obj.get('proposed_article', ''),
+            '法律要件': ' + '.join(elements) if elements else '',
+            '本人姓名': case_obj.get('name', ''),
+            '本人性别': case_obj.get('gender', ''),
+            '本人年龄': case_obj.get('age', ''),
+            '本人身份证号': case_obj.get('id_card', ''),
+            '本人手机号': case_obj.get('phone', ''),
+            '本人身份证地址': case_obj.get('address', ''),
+            '本人岗位': case_obj.get('position', ''),
+            '受伤经过': case_obj.get('injury_description', ''),
+            '已提供材料': '、'.join(material_names) if material_names else '',
+            '记录人': case_obj.get('recorder', '') or self._get_current_username(),
+            '申请人名称': case_obj.get('applicant_name', ''),
+            '用户名': self._get_current_username(),
+            '当前时期': self.get_data('当前时期', '') or (_date_now() + _time_now()),
+        }
+
+        # 英文 key（case_obj 字段名，兼容写法）
+        en = {
+            'case_id': case_obj.get('case_id', ''),
+            'case_nature': case_obj.get('case_nature', ''),
+            'applicant_type': case_obj.get('applicant_type', ''),
+            'employer': case_obj.get('employer', ''),
+            'labor_unit': case_obj.get('labor_unit', ''),
+            'site': case_obj.get('site', ''),
+            'apply_time': case_obj.get('apply_time', ''),
+            'accept_time': case_obj.get('accept_time', ''),
+            'proposed_article': case_obj.get('proposed_article', ''),
+            'proposed_article_elements': ' + '.join(elements) if elements else '',
+            'name': case_obj.get('name', ''),
+            'gender': case_obj.get('gender', ''),
+            'age': case_obj.get('age', ''),
+            'id_card': case_obj.get('id_card', ''),
+            'phone': case_obj.get('phone', ''),
+            'address': case_obj.get('address', ''),
+            'position': case_obj.get('position', ''),
+            'injury_description': case_obj.get('injury_description', ''),
+            'materials': '、'.join(material_names) if material_names else '',
+            'recorder': case_obj.get('recorder', '') or self._get_current_username(),
+            'applicant_name': case_obj.get('applicant_name', ''),
+        }
+
+        merged = dict(zh)
+        merged.update(en)
+        return merged
+
+    def _build_case_object(self, data, materials) -> Dict[str, Any]:
+        """构建单个案件对象（case_id 为第一字段）
+
+        - 本人数据平铺在顶层，injury_description 仅本人
+        - materials 只保留「已提供（勾选）」的证据
+        - 含记录人、申请人名称、证人（并入 cases_data.json，单一数据源）
+        """
+        case = {
+            "case_id": data.get('case_id', ''),
+            "applicant_name": data.get('name', '') if data.get('applicant_type', '') == '个人申请' else data.get('labor_unit', ''),
+            "case_nature": data.get('case_nature', ''),
+            "applicant_type": data.get('applicant_type', ''),
+            "employer": data.get('employer', ''),
+            "labor_unit": data.get('labor_unit', ''),
+            "site": data.get('site', ''),
+            "apply_time": data.get('apply_time', ''),
+            "accept_time": data.get('accept_time', ''),
+            "proposed_article": data.get('regulation', ''),
+            "proposed_article_elements": _regulation_elements(data.get('regulation', '')),
+            # ── 本人（一套完整数据）──
+            "name": data.get('name', ''),
+            "gender": data.get('gender', ''),
+            "age": data.get('age', ''),
+            "id_card": data.get('id_card', ''),
+            "phone": data.get('phone', ''),
+            "address": data.get('address', ''),
+            "position": data.get('position', ''),
+            "injury_description": data.get('injury_desc', ''),
+            "materials": _filter_provided(materials),
+            # ── 记录人 / 证人 ──
+            "recorder": self._get_current_username(),
+            "witnesses": list(self.data_model.witnesses),
+            "legal_reps": self._collect_legal_reps(),
+        }
+        return case
+
+    # ========================================================================
+    # AI 条例判断 + 证据分析
+    # ========================================================================
+
+    def _analyze_case_with_ai(self, case_id: str):
+        """对已保存的案件进行 AI 条例与证据分析"""
+        if not case_id:
+            self._set_status('无案本号，无法分析', 'orange')
+            return
+        if not self.ai_service:
+            self._set_status('未配置AI，无法分析', 'orange')
+            QMessageBox.warning(self, "提示", "未配置API密钥，无法进行AI条例分析。\n请在顶部⚙配置中设置API密钥。")
+            return
+        case_obj = self._load_cases_data().get(case_id)
+        if not case_obj:
+            QMessageBox.warning(self, "提示", "未找到该案本号的案件数据")
+            return
+
+        self._set_status('正在AI分析条例与证据...', 'black')
+        QApplication.processEvents()
+
+        self.analysis_worker = RegulationAnalyzeWorker(self.ai_service, case_obj)
+        self.analysis_worker.finished.connect(
+            lambda result: self._on_analysis_finished(case_id, result)
+        )
+        self.analysis_worker.error.connect(self._on_analysis_error)
+        self.analysis_worker.start()
+
+    def _on_analysis_finished(self, case_id: str, result: dict):
+        self._set_status('AI分析完成', 'green')
+        if '错误' in result:
+            QMessageBox.warning(self, "AI分析失败", result.get('错误', '未知错误'))
+            return
+        # AI 分析完成后，用案件数据渲染「发送给AI的模板」并打开给用户查看
+        self._generate_ai_template_and_open(case_id)
+        self._show_regulation_analysis(case_id, result)
+
+    def _generate_ai_template_and_open(self, case_id: str):
+        """AI 条例与证据分析完成后，渲染并打开「发送给AI的模板」→ 把全文发给 AI 生成询问笔录 → 生成 Word 打开"""
+        try:
+            case_obj = self._load_cases_data().get(case_id)
+            if not case_obj:
+                print(f"⚠️ 生成「发送给AI」文档失败：未找到案件数据（{case_id}）")
+                return
+
+            # ── 1. 构建模板数据（统一中文占位符，附带英文 key）──
+            template_data = self._build_unified_template_data(case_obj)
+
+            # ── 2. 获取模板路径 ──
+            template_path = str(path_utils.get_document_template_path('发送给AI的模板.docx'))
+            if not os.path.exists(template_path):
+                print(f"⚠️ 模板文件不存在: {template_path}")
+                return
+
+            # ── 3. 渲染模板 ──
+            from docxtpl import DocxTemplate
+            word = DocxTemplate(template_path)
+            word.render(template_data)
+
+            # ── 4. 确保有案件文件夹 ──
+            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
+                folder_subject = str(case_obj.get('case_id', '') or case_obj.get('name', '') or '案件').strip()
+                self.current_case_folder = os.path.join(self.BASE_PATH, folder_subject)
+                os.makedirs(self.current_case_folder, exist_ok=True)
+
+            # ── 5. 保存文件（重名自动递增）──
+            subject = str(case_obj.get('name', '') or case_obj.get('case_id', '') or '案件').strip()
+            file_name = f"发送给AI_{subject}.docx"
+            target_path = os.path.join(self.current_case_folder, file_name)
+            counter = 2
+            while os.path.exists(target_path):
+                file_name = f"发送给AI_{subject}({counter}).docx"
+                target_path = os.path.join(self.current_case_folder, file_name)
+                counter += 1
+
+            word.save(target_path)
+            print(f"✅ 「发送给AI」文档已生成: {target_path}")
+
+            # ── 6. 打开「发送给AI」文档给用户查看 ──
+            success, message = self.file_service.open_document(target_path)
+            if success:
+                self._set_status('已生成并打开「发送给AI」文档', 'green')
+            else:
+                self._set_status(f'「发送给AI」文档已生成，打开失败: {message}', 'orange')
+
+            # ── 7. 提取渲染后的全文 ──
+            from docx import Document
+            rendered = Document(target_path)
+            full_text = "\n".join(p.text for p in rendered.paragraphs if p.text.strip())
+            print(f"📝 提取模板全文 {len(full_text)} 字符，准备发送给 AI")
+
+            # ── 8. 把全文发给 AI 生成询问笔录（后台线程）──
+            self._start_transcript_generation(case_id, case_obj, full_text)
+
+        except Exception as e:
+            print(f"❌ 生成「发送给AI」文档异常: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _start_transcript_generation(self, case_id: str, case_obj: dict, full_text: str):
+        """启动后台线程，把模板全文发给 AI 生成询问笔录"""
+        self._set_status('正在AI生成询问笔录...', 'black')
+        QApplication.processEvents()
+        self.transcript_worker = TranscriptFromTemplateWorker(self.ai_service, full_text)
+        self.transcript_worker.finished.connect(
+            lambda result, cid=case_id, co=case_obj: self._on_transcript_generated(cid, co, result)
+        )
+        self.transcript_worker.error.connect(self._on_transcript_error)
+        self.transcript_worker.start()
+
+    def _on_transcript_generated(self, case_id: str, case_obj: dict, result: dict):
+        if result.get("状态") != "成功":
+            err = result.get("错误信息", "未知错误")
+            print(f"⚠️ 询问笔录生成失败: {err}")
+            self._set_status(f'询问笔录生成失败: {err[:40]}', 'orange')
+            return
+        content = (result.get("内容", "") or "").strip()
+        if not content:
+            print("⚠️ 询问笔录生成失败：AI 返回内容为空")
+            self._set_status('询问笔录生成失败：AI 返回内容为空', 'orange')
+            return
+        path = self._save_transcript_to_template(case_obj, content)
+        if not path:
+            return
+        success, message = self.file_service.open_document(path)
+        if success:
+            self._set_status('已生成并打开本人谈话笔录', 'green')
+        else:
+            self._set_status(f'本人谈话笔录已生成，打开失败: {message}', 'orange')
+
+    def _on_transcript_error(self, err: str):
+        print(f"❌ 询问笔录生成出错: {err}")
+        self._set_status('询问笔录生成出错', 'red')
+
+    def _save_transcript_to_template(self, case_obj: dict, content: str) -> str:
+        """渲染「本人谈话笔录（普通工伤案件）.docx」模板，把 AI 生成的问答内容（去标题）插入到告知程序之后，返回文件路径（失败返回空串）"""
+        try:
+            from docx.shared import Pt
+
+            # ── 1. 渲染谈话模板（替换占位符）──
+            template_path = str(path_utils.get_talk_template_path('本人谈话笔录（普通工伤案件）.docx'))
+            if not os.path.exists(template_path):
+                print(f"⚠️ 谈话模板不存在: {template_path}")
+                return ""
+
+            template_data = self._build_unified_template_data(case_obj)
+
+            from docx import Document
+            doc = Document(template_path)
+            # docxtpl 对跨 run 的中文占位符替换不可靠，改用段落全文手动替换
+            for para in doc.paragraphs:
+                text = para.text
+                if '{{' not in text:
+                    continue
+                new_text = text
+                for key, value in template_data.items():
+                    new_text = new_text.replace('{{' + key + '}}', str(value))
+                if new_text != text:
+                    if para.runs:
+                        para.runs[0].text = new_text
+                        for run in para.runs[1:]:
+                            run.text = ''
+                    else:
+                        para.add_run(new_text)
+
+            # ── 2. 定位「答：听清楚了，不申请回避。」锚点 ──
+            anchor_index = None
+            anchor_pf = None
+            for i, p in enumerate(doc.paragraphs):
+                if '答：听清楚了，不申请回避' in p.text:
+                    anchor_index = i
+                    anchor_pf = p.paragraph_format
+                    break
+
+            # ── 3. 在锚点之后插入 AI 问答内容（去标题，按锚点格式：15号字不加粗），保留后面的样例正文 ──
+            if anchor_index is not None and anchor_index + 1 < len(doc.paragraphs):
+                next_p = doc.paragraphs[anchor_index + 1]
+            else:
+                next_p = None
+
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if next_p is not None:
+                    p = next_p.insert_paragraph_before()
+                else:
+                    p = doc.add_paragraph()
+                if anchor_pf is not None:
+                    p.paragraph_format.alignment = anchor_pf.alignment
+                    p.paragraph_format.first_line_indent = anchor_pf.first_line_indent
+                    p.paragraph_format.space_before = anchor_pf.space_before
+                    p.paragraph_format.space_after = anchor_pf.space_after
+                run = p.add_run(line)
+                run.font.size = Pt(15)
+
+            # ── 5. 保存 ──
+            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
+                folder_subject = str(case_obj.get('case_id', '') or case_obj.get('name', '') or '案件').strip()
+                self.current_case_folder = os.path.join(self.BASE_PATH, folder_subject)
+                os.makedirs(self.current_case_folder, exist_ok=True)
+
+            subject = str(case_obj.get('name', '') or case_obj.get('case_id', '') or '案件').strip()
+            file_name = f"{subject}本人谈话笔录.docx"
+            target_path = os.path.join(self.current_case_folder, file_name)
+            counter = 2
+            while os.path.exists(target_path):
+                file_name = f"{subject}本人谈话笔录({counter}).docx"
+                target_path = os.path.join(self.current_case_folder, file_name)
+                counter += 1
+
+            doc.save(target_path)
+            print(f"✅ 本人谈话笔录已生成: {target_path}")
+            return target_path
+        except Exception as e:
+            print(f"❌ 生成本人谈话笔录失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self._set_status('生成本人谈话笔录失败', 'red')
+            return ""
+
+    def _on_analysis_error(self, err: str):
+        self._set_status('AI分析出错', 'red')
+        QMessageBox.critical(self, "AI分析错误", f"分析出错: {err}")
+
+    def _show_regulation_analysis(self, case_id: str, result: dict):
+        judged = result.get('judged_article', '')
+        judged_reason = result.get('judged_article_reason', '')
+        missing = result.get('missing_evidence', []) or []
+        consistency = result.get('consistency', '')
+        reason = result.get('reason', '')
+        proposed = self._load_cases_data().get(case_id, {}).get('proposed_article', '')
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI 条例分析结果")
+        dlg.resize(620, 600)
+        layout = QVBoxLayout(dlg)
+
+        title = QLabel("AI 条例与证据分析")
+        title.setStyleSheet("font-size: 15px; font-weight: bold; padding: 4px;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFont(QFont("微软雅黑", 10))
+        lines = [
+            "【判断应适用条例】",
+            f"　{judged}",
+        ]
+        if judged_reason:
+            lines.append(f"　依据：{judged_reason}")
+        lines.append("")
+        lines.append("【工作人员拟用条例】")
+        lines.append(f"　{proposed or '未填写'}")
+        lines.append("")
+        lines.append("【一致/分歧判断】")
+        lines.append(f"　{consistency}")
+        if reason:
+            lines.append(f"　理由：{reason}")
+        lines.append("")
+        lines.append("【尚缺关键证据清单】")
+        if missing:
+            for i, e in enumerate(missing, 1):
+                lines.append(f"　{i}. {e}")
+        else:
+            lines.append("　（无）")
+        text.setPlainText("\n".join(lines))
+        layout.addWidget(text, 1)
+
+        btn_layout = QHBoxLayout()
+        if consistency == '分歧':
+            q = QLabel("是否把拟用条例修改为 AI 判断的条例？")
+            q.setStyleSheet("color:#c0392b; font-weight:bold;")
+            btn_layout.addWidget(q)
+            btn_layout.addStretch()
+            no_btn = QPushButton("否")
+            no_btn.clicked.connect(lambda: self._on_regulation_choice(False, dlg, case_id, judged, missing))
+            btn_layout.addWidget(no_btn)
+            yes_btn = QPushButton("是")
+            yes_btn.setStyleSheet(
+                "QPushButton{background-color:#27ae60;color:white;font-weight:bold;padding:5px 22px;border-radius:4px;}"
+            )
+            yes_btn.clicked.connect(lambda: self._on_regulation_choice(True, dlg, case_id, judged, missing))
+            btn_layout.addWidget(yes_btn)
+        else:
+            btn_layout.addStretch()
+            close_btn = QPushButton("关闭")
+            close_btn.clicked.connect(dlg.accept)
+            btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+        dlg.exec_()
+
+    def _on_regulation_choice(self, yes: bool, dlg: QDialog, case_id: str, judged: str, missing: list):
+        dlg.accept()
+        if yes:
+            self._apply_regulation_change(case_id, judged, missing)
+            QMessageBox.information(self, "已修改", f"拟用条例已修改为：{judged}\n关键证据清单已相应更新。")
+        else:
+            self._set_status('已保留原拟用条例', 'black')
+
+    def _apply_regulation_change(self, case_id: str, judged_article: str, missing_evidence: list):
+        """把拟用条例修改为 AI 判断的条例，并同步界面 + JSON + 证据清单"""
+        # 1. 主界面条例下拉框 + 数据模型
+        self._apply_regulation(judged_article)
+        # 2. JSON 里的 proposed_article
+        cases = self._load_cases_data()
+        case_obj = cases.get(case_id)
+        if case_obj:
+            case_obj['proposed_article'] = judged_article
+            case_obj['proposed_article_elements'] = _regulation_elements(judged_article)
+            self._save_cases_data(cases)
+        # 3. 更新关键证据清单：把缺失证据作为未勾选项补进材料清单
+        if missing_evidence and hasattr(self, 'material_list'):
+            current = self.material_list.get_materials()
+            existing = {m.get('name', '') for m in current}
+            for ev in missing_evidence:
+                if ev and ev not in existing:
+                    current.append({"name": ev, "provided": False, "notes": ""})
+                    existing.add(ev)
+            self.material_list.set_materials(current)
+            self.data_model.investigation['本人材料'] = current
+        self._set_status(f'拟用条例已修改为：{judged_article}', 'green')
+
+    # ========================================================================
+    # F2 测试数据轮换
+    # ========================================================================
+
+    def keyPressEvent(self, event):
+        """F2 键轮换测试数据"""
+        if event.key() == Qt.Key_F2:
+            self._cycle_test_data()
+        else:
+            super().keyPressEvent(event)
+
+    def _cycle_test_data(self):
+        """按 F2 切换到下一组测试数据"""
+        self._test_data_index = (self._test_data_index + 1) % len(TEST_DATA_PRESETS)
+        data = TEST_DATA_PRESETS[self._test_data_index]
+
+        print(f"\n{'=' * 50}")
+        print(f"F2 测试数据: {data['name']}")
+        print(f"{'=' * 50}")
+
+        # ── 角色单选按钮 ──
+        role_map = {"本人": self.radioButton, "证人": self.radioButton_2, "法人": self.radioButton_3}
+        for role_name, btn in role_map.items():
+            btn.setChecked(role_name == data["role"])
+        # 程序化 setChecked 不会触发 clicked，手动触发一次角色切换清理
+        self.clear_role_fields()
+
+        # ── 案例类型复选框 ──
+        self.death_case_checkbox.setChecked(data["deathCaseCheckbox"])
+        self.personal_application_checkbox.setChecked(data["personalApplicationCheckbox"])
+        self.on_case_type_changed()
+
+        # ── 基本信息输入框 ──
+        self.name_pane.setText(data["name_pane"])
+        self.idnumer_pane.setText(data["idnumer_pane"])
+        self.textEdit.setPlainText(data["textEdit"])
+        self.lineEdit_4.setText(data["lineEdit_4"])
+        self.lineEdit_5.setText(data["lineEdit_5"])
+        self.lineEdit_2.clear()  # 案本号不预填，保持为空
+
+        # ── 条例下拉框 ──
+        self.comboBox.setCurrentIndex(data["comboBox"])
+
+        # ── 公司下拉框 ──
+        self._set_combo_or_type(self.company_pane, data["company_pane"])
+        self._set_combo_or_type(self.construction_company, data["construction_company"])
+        self._set_combo_or_type(self.construction_plant, data["construction_plant"])
+
+        # ── 自动计算年龄和性别 ──
+        self.on_id_input_finished()
+
+        # ── 同步角色数据到数据模型，供 JSON 保存（本人=键，证人是列表，法人是单条键） ──
+        role = self.get_current_role_type()
+        if role == "本人":
+            self.set_data('本人姓名', data['name_pane'], 'basic')
+            self.set_data('本人手机号', data['lineEdit_4'], 'basic')
+            self.set_data('本人身份证地址', data['textEdit'], 'basic')
+            self.set_data('本人岗位', data['lineEdit_5'], 'basic')
+        elif role == "证人":
+            name = data['name_pane']
+            w = next((x for x in self.data_model.witnesses if x.get('姓名') == name), None)
+            if w is None:
+                w = {"序号": _witness_label(len(self.data_model.witnesses) + 1)}
+                self.data_model.witnesses.append(w)
+            w.update({
+                "姓名": name,
+                "身份证号": data['idnumer_pane'],
+                "身份证地址": data['textEdit'],
+                "手机号": data['lineEdit_4'],
+                "岗位": data['lineEdit_5'],
+                "性别": self.lineEdit.text().strip(),
+                "年龄": self.age_pane.text().strip(),
+            })
+        elif role == "法人":
+            self.set_data('法人姓名', data['name_pane'], 'basic')
+            self.set_data('法人身份证号', data['idnumer_pane'], 'basic')
+            self.set_data('法人身份证地址', data['textEdit'], 'basic')
+            self.set_data('法人手机号', data['lineEdit_4'], 'basic')
+            self.set_data('法人职务', data['lineEdit_5'], 'basic')
+
+        # ── 右侧面板（同案沿用） ──
+        current_worker = data.get("injured_worker", "")
+        prev_worker = getattr(self, '_prev_injured_worker', None)
+        is_same_case = (prev_worker is not None and current_worker == prev_worker)
+        if not is_same_case:
+            self.current_case_id = ""  # 换了受伤职工 → 视为新案件，重置案本号关联
+            self.set_data('案本号', '', 'case')  # 同时清掉数据模型里缓存的旧案本号
+
+        if hasattr(self, 'statement_edit'):
+            if is_same_case:
+                if not self.statement_edit.toPlainText().strip() and data.get("statement_edit"):
+                    self.statement_edit.setPlainText(data.get("statement_edit", ""))
+                print(f"📋 同案沿用案件陈述（{current_worker}）")
+            else:
+                self.statement_edit.setPlainText(data.get("statement_edit", ""))
+
+        # 材料：只有本人的证据有效（证人/法人的证据不保存）
+        if role == "本人":
+            mats = data.get('materials', [])
+            if hasattr(self, 'material_list'):
+                self.material_list.set_materials(mats)
+            self.data_model.investigation['本人材料'] = mats
+        else:
+            # 证人/法人：恢复显示本人证据，不显示证人/法人证据
+            if hasattr(self, 'material_list'):
+                self.material_list.set_materials(self.data_model.investigation.get('本人材料', []))
+
+        self._prev_injured_worker = current_worker
+
+        # ── 重置案件状态，允许重新生成笔录 ──
+        self.pushButton.setEnabled(True)
+        self.pushButton.setStyleSheet("")
+        self.current_case_folder = None
+        self.current_person_name = ""
+
+        # ── 状态提示 ──
+        label = (f"[测试 {self._test_data_index + 1}/{len(TEST_DATA_PRESETS)}] "
+                 f"{data['name']}  |  F2=下一个")
+        self._set_status(label, 'green')
+        print(f"OK 测试数据已填充: {data['name']}")
 
     def on_role_changed(self):
         """当角色切换时调用"""
@@ -1366,7 +2353,7 @@ class MainWindow(QWidget, Ui_Form):
             # ── 2. 收集模板数据 ──
             company_name = self.company_pane.currentText().strip()
             if not company_name:
-                company_name = self.get_data('公司名称', '')
+                company_name = self.get_data('用工单位', '')
 
             employer = self.construction_company.currentText().strip()
             site = self.construction_plant.currentText().strip()
@@ -1385,7 +2372,7 @@ class MainWindow(QWidget, Ui_Form):
             current_time = _time_now()
 
             template_data = {
-                '公司名称': company_name,
+                '用人单位': company_name,
                 '本人姓名': person_name,
                 '本人性别': gender,
                 '本人身份证号': id_number,
@@ -1517,7 +2504,7 @@ class MainWindow(QWidget, Ui_Form):
 
             # 搜索关键词映射
             search_mapping = {
-                '用人单位': '公司名称',
+                '用人单位': '用人单位',
                 '职工姓名': '职工姓名',
                 '身份证号': '职工身份证号',
                 '申请时间': '申请时间',
@@ -1562,7 +2549,7 @@ class MainWindow(QWidget, Ui_Form):
                                     print(f"  ⚠️ {data_field}: 没有右侧单元格")
 
             print("\n📋 提取结果:")
-            required_fields = ['公司名称', '职工姓名', '职工身份证号', '申请时间', '受理时间', '受伤经过', '医疗证明']
+            required_fields = ['用人单位', '职工姓名', '职工身份证号', '申请时间', '受理时间', '受伤经过', '医疗证明']
 
             for field in required_fields:
                 if field in extracted_data:
@@ -1586,8 +2573,8 @@ class MainWindow(QWidget, Ui_Form):
                 print(f"  🟥 使用默认值 医疗证明: 详见医疗诊断证明")
 
             # 其他字段使用界面数据
-            if '公司名称' not in extracted_data:
-                extracted_data['公司名称'] = self.company_pane.currentText().strip() or '未知公司'
+            if '用人单位' not in extracted_data:
+                extracted_data['用人单位'] = self.company_pane.currentText().strip() or '未知公司'
 
             if '职工姓名' not in extracted_data:
                 extracted_data['职工姓名'] = self.get_data('本人姓名', '') or self.name_pane.text().strip() or '未知'
@@ -1605,7 +2592,7 @@ class MainWindow(QWidget, Ui_Form):
             # 返回最小可用数据
             current_date = _date_now()
             return {
-                '公司名称': self.company_pane.currentText().strip() or '未知公司',
+                '用人单位': self.company_pane.currentText().strip() or '未知公司',
                 '职工姓名': self.get_data('本人姓名', '') or self.name_pane.text().strip() or '未知',
                 '职工身份证号': self.get_data('本人身份证号', ''),
                 '申请时间': current_date,
@@ -1673,7 +2660,7 @@ class MainWindow(QWidget, Ui_Form):
                 return
 
             # 检查必要字段
-            required_fields = ['公司名称', '职工姓名', '职工身份证号', '申请时间', '受理时间', '受伤经过', '医疗证明']
+            required_fields = ['用人单位', '职工姓名', '职工身份证号', '申请时间', '受理时间', '受伤经过', '医疗证明']
             missing_required = []
 
             for field in required_fields:
@@ -1693,7 +2680,7 @@ class MainWindow(QWidget, Ui_Form):
             from docxtpl import RichText
 
             template_data = {
-                '公司名称': extracted_data.get('公司名称', self.company_pane.currentText().strip()),
+                '用人单位': extracted_data.get('用人单位', self.company_pane.currentText().strip()),
                 '本人姓名': extracted_data.get('职工姓名', self.get_data('本人姓名', '')),
                 '职工性别': extracted_data.get('职工性别', self.get_data('本人性别', '')),
                 '本人身份证号': extracted_data.get('职工身份证号', self.get_data('本人身份证号', '')),
@@ -2552,9 +3539,9 @@ class MainWindow(QWidget, Ui_Form):
             current_time = _time_now()
 
             # 获取公司信息
-            company_name = extracted_data.get('公司名称', self.company_pane.currentText().strip())
+            company_name = extracted_data.get('用人单位', self.company_pane.currentText().strip())
             if not company_name:
-                company_name = self.get_data('公司名称', '未知公司')
+                company_name = self.get_data('用工单位', '未知公司')
 
             # 获取身份证号
             id_number = extracted_data.get('职工身份证号', self.get_data('本人身份证号', ''))
@@ -2564,7 +3551,7 @@ class MainWindow(QWidget, Ui_Form):
 
             # 准备模板数据
             template_data = {
-                '公司名称': company_name,
+                '用人单位': company_name,
                 '本人姓名': extracted_data.get('职工姓名', person_name),
                 '职工性别': extracted_data.get('职工性别', self.get_data('本人性别', '')),
                 '本人身份证号': id_number,
@@ -2835,29 +3822,32 @@ class MainWindow(QWidget, Ui_Form):
         self.data_model.current_witness_index = index
         self._sync_current_witness_to_form()
 
-    def _witness_json_path(self) -> Optional[str]:
-        if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-            return None
-        return os.path.join(self.current_case_folder, "证人信息.json")
-
     def _save_witnesses(self):
-        path = self._witness_json_path()
-        if not path:
+        """把证人数据写回 cases_data.json 的当前案件（单一数据源，不再单独存证人信息.json）"""
+        case_id = (self.current_case_id or '').strip() or self.lineEdit_2.text().strip()
+        if not case_id:
             return
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump({"witnesses": self.data_model.witnesses}, f, ensure_ascii=False, indent=2)
+            cases = self._load_cases_data()
+            case_obj = cases.get(case_id)
+            if case_obj is None:
+                return
+            case_obj['witnesses'] = list(self.data_model.witnesses)
+            self._save_cases_data(cases)
+            print(f"✅ 证人信息已保存到案件数据: {len(self.data_model.witnesses)} 位证人")
         except Exception as e:
             print(f"保存证人信息失败: {e}")
 
     def _load_witnesses(self):
-        path = self._witness_json_path()
-        if not path or not os.path.exists(path):
+        """从 cases_data.json 的当前案件读取证人数据"""
+        case_id = (self.current_case_id or '').strip() or self.lineEdit_2.text().strip()
+        if not case_id:
             return
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self.data_model.witnesses = data.get("witnesses", [])
+            case_obj = self._load_cases_data().get(case_id)
+            if case_obj is None:
+                return
+            self.data_model.witnesses = list(case_obj.get('witnesses', []))
             self.data_model.current_witness_index = -1
             self._refresh_witness_combo()
             print(f"✅ 加载证人信息: {len(self.data_model.witnesses)} 位证人")
@@ -2915,30 +3905,30 @@ class MainWindow(QWidget, Ui_Form):
             data_dir = path_utils.get_data_path("")
             print(f"🔍 数据目录: {data_dir}")
 
-            # 公司名称 - 使用数据目录
-            company_file = str(data_dir / '公司名称汇总.xlsx')
-            print(f"🔍 公司名称文件: {company_file}")
+            # 用工单位 - 使用数据目录
+            company_file = str(data_dir / '用工单位汇总.xlsx')
+            print(f"🔍 用工单位文件: {company_file}")
 
             if os.path.exists(company_file):
                 try:
                     file = pd.read_excel(company_file)
-                    self.items_list = file['公司名称汇总'].tolist()
-                    print(f"✅ 加载公司名称: {len(self.items_list)}个")
+                    self.items_list = file['用工单位汇总'].tolist()
+                    print(f"✅ 加载用工单位: {len(self.items_list)}个")
                     if self.items_list:
                         print(f"   示例: {self.items_list[:3]}")
                 except Exception as e:
-                    print(f"❌ 读取公司名称文件失败: {e}")
+                    print(f"❌ 读取用工单位文件失败: {e}")
                     self.items_list = ['公司A', '公司B', '公司C']  # 默认数据
             else:
-                print("⚠️ 公司名称文件不存在，创建默认文件")
+                print("⚠️ 用工单位文件不存在，创建默认文件")
                 self.items_list = ['公司A', '公司B', '公司C']
                 # 创建默认文件
                 try:
-                    df = pd.DataFrame(self.items_list, columns=['公司名称汇总'])
+                    df = pd.DataFrame(self.items_list, columns=['用工单位汇总'])
                     df.to_excel(company_file, index=False)
-                    print(f"✅ 创建默认公司名称文件")
+                    print(f"✅ 创建默认用工单位文件")
                 except Exception as e:
-                    print(f"❌ 创建公司名称文件失败: {e}")
+                    print(f"❌ 创建用工单位文件失败: {e}")
 
             # 用人单位 - 使用数据目录
             employer_file = str(data_dir / '用人单位汇总.xlsx')
@@ -3013,34 +4003,32 @@ class MainWindow(QWidget, Ui_Form):
             traceback.print_exc()
 
     def save_company(self):
-        """保存公司名称到Excel"""
+        """保存用人单位到Excel（company_pane 现为用人单位）"""
         new_item = self.company_pane.currentText().strip()
-        if new_item and new_item not in self.items_list:
-            # 使用FileService保存（不需要传递路径，file_service内部使用path_utils）
-            self.items_list = self.file_service.save_to_excel(
-                "",  # 第一个参数可以是空字符串
-                '公司名称汇总.xlsx',
-                '公司名称汇总',
-                new_item,
-                self.items_list
-            )
-            # 更新下拉框
-            self.init_combobox(self.company_pane, self.items_list)
-            print(f"💾 保存公司名称: {new_item}")
-
-    def save_construction_company(self):
-        """保存用人单位到Excel"""
-        new_item = self.construction_company.currentText().strip()
         if new_item and new_item not in self.items_list1:
             self.items_list1 = self.file_service.save_to_excel(
-                "",  # 空字符串
+                "",
                 '用人单位汇总.xlsx',
                 '用人单位汇总',
                 new_item,
                 self.items_list1
             )
-            self.init_combobox(self.construction_company, self.items_list1)
+            self.init_combobox(self.company_pane, self.items_list1)
             print(f"💾 保存用人单位: {new_item}")
+
+    def save_construction_company(self):
+        """保存用工单位到Excel（construction_company 现为用工单位）"""
+        new_item = self.construction_company.currentText().strip()
+        if new_item and new_item not in self.items_list:
+            self.items_list = self.file_service.save_to_excel(
+                "",
+                '用工单位汇总.xlsx',
+                '用工单位汇总',
+                new_item,
+                self.items_list
+            )
+            self.init_combobox(self.construction_company, self.items_list)
+            print(f"💾 保存用工单位: {new_item}")
 
     def save_construction_plant(self):
         """保存工地名称到Excel"""
@@ -3156,7 +4144,7 @@ class MainWindow(QWidget, Ui_Form):
         """检测基础键名的类别"""
         if key in ['姓名', '年龄', '性别', '身份证号', '身份证地址', '手机号', '岗位', '职务']:
             return 'basic'
-        elif key in ['公司名称', '用人单位', '工地名称']:
+        elif key in ['用工单位', '用人单位', '工地名称']:
             return 'company'
         elif key in ['案件性质', '申请类型', '案本号', '案件类型']:
             return 'case'
@@ -3236,6 +4224,83 @@ class MainWindow(QWidget, Ui_Form):
         # TODO: 待补充具体处理逻辑
         pass
 
+    def _extract_medical_conclusion(self, case_folder: str) -> str:
+        """从本人笔录 docx 中提取医疗结论（受伤部位/诊断结论）"""
+        try:
+            if not case_folder or not os.path.exists(case_folder):
+                return ""
+            # 找本人笔录文件
+            person_files = [f for f in os.listdir(case_folder)
+                            if "本人" in f and f.endswith('.docx') and "审批表" not in f]
+            if not person_files:
+                print("⚠️ 未找到本人笔录文件，无法提取医疗结论")
+                return ""
+
+            file_path = os.path.join(case_folder, person_files[0])
+            document = Document(file_path)
+            injury_location = ""
+
+            for i, paragraph in enumerate(document.paragraphs):
+                text = paragraph.text
+                if ("医疗结论" in text or "诊断结论" in text or "医院诊断" in text) \
+                        and i + 1 < len(document.paragraphs):
+                    next_para = document.paragraphs[i + 1].text.strip()
+                    if next_para.startswith("答："):
+                        injury_location = next_para[2:].strip()
+                        break
+
+            if not injury_location:
+                print("⚠️ 笔录中未找到医疗结论")
+                return ""
+
+            # 去掉常见开头
+            for prefix in ["医院对我的结论是：", "医院结论是：", "医院诊断是：",
+                           "诊断结论是：", "医疗结论是：", "结论是：", "诊断为："]:
+                if injury_location.startswith(prefix):
+                    injury_location = injury_location[len(prefix):]
+                    break
+
+            # 去掉冒号前缀
+            if "：" in injury_location:
+                parts = injury_location.split("：", 1)
+                if len(parts) > 1 and parts[1].strip():
+                    injury_location = parts[1]
+
+            # 清理结尾标点
+            injury_location = injury_location.rstrip('。.').rstrip('，,').strip()
+
+            # 写入数据模型
+            self.data_model.investigation['医院诊断'] = injury_location
+            self.data_model.investigation['医疗结论'] = injury_location
+
+            print(f"✅ 提取的医疗结论/受伤部位: {injury_location}")
+            return injury_location
+
+        except Exception as e:
+            print(f"⚠️ 提取医疗结论失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    def _read_person_transcript_from_folder(self, case_folder: str) -> str:
+        """读取案件文件夹下本人笔录全文"""
+        try:
+            if not case_folder or not os.path.exists(case_folder):
+                return ""
+            person_files = [f for f in os.listdir(case_folder)
+                            if "本人" in f and f.endswith('.docx') and "审批表" not in f]
+            if not person_files:
+                print("⚠️ 未找到本人笔录文件")
+                return ""
+            file_path = os.path.join(case_folder, person_files[0])
+            document = Document(file_path)
+            text = "\n".join(p.text for p in document.paragraphs if p.text.strip())
+            print(f"📄 读取本人笔录: {os.path.basename(file_path)} ({len(text)}字符)")
+            return text
+        except Exception as e:
+            print(f"⚠️ 读取本人笔录失败: {e}")
+            return ""
+
     def approve(self):
         """生成案件审批表 — 读取案本号 → JSON查数据 → 渲染模板"""
         try:
@@ -3246,12 +4311,23 @@ class MainWindow(QWidget, Ui_Form):
                 QMessageBox.warning(self, "提示", "请先输入或生成案本号")
                 return
 
-            # ── 2. 在JSON数据里查找对应数据 ──
-            case_data = self.case_index_manager.find_by_case_number(case_number)
-            if not case_data:
+            # ── 2. 在 cases_data.json 里查找对应数据 ──
+            case_obj = self._load_cases_data().get(case_number)
+            if not case_obj:
                 self._set_status('JSON中未找到该案本号', 'red')
                 QMessageBox.warning(self, "提示", f"未在数据中找到案本号：{case_number}")
                 return
+            # 用案件数据构建 case_data（字段名兼容原有索引字段，后面逻辑不变）
+            case_data = {
+                'case_id': case_obj.get('case_id', ''),
+                'person_name': case_obj.get('name', ''),
+                'company_name': case_obj.get('labor_unit', ''),
+                'applicant_name': case_obj.get('applicant_name', ''),
+                'regulation': _regulation_short_to_full(case_obj.get('proposed_article', '')),
+                'folder_name': case_obj.get('folder_name', ''),
+                'person_gender': case_obj.get('gender', ''),
+                'id_card': case_obj.get('id_card', ''),
+            }
 
             person_name = case_data.get('person_name', '')
             company_name = case_data.get('company_name', '')
@@ -3264,15 +4340,81 @@ class MainWindow(QWidget, Ui_Form):
                 applicant_name = person_name if self.personal_application_checkbox.isChecked() else company_name
             self.set_data('申请人名称', applicant_name, 'case')
 
-            # ── 4. 用JSON数据构建模板变量（{{受伤经过}}先不替换）──
+            # ── 3.1 认定结论（予以认定/不予认定）──
+            is_confirm = self.confirm_injury_checkbox.isChecked()
+            conclusion = "予以认定" if is_confirm else "不予认定"
+            self.set_data('认定结论', conclusion, 'case')
+            self._update_case_field(case_number, conclusion=conclusion)
+
+            # 不予认定：先只发提醒（后续再调用案件审批预览函数）
+            if not is_confirm:
+                self._set_status('不予认定（待后续处理）', 'orange')
+                QMessageBox.information(self, "提示", "本案认定为「不予认定」，此部分流程待后续实现。")
+                return
+
+            # ── 4. 确定案件文件夹 ──
+            folder_name = case_data.get('folder_name', '')
+            case_folder = os.path.join(self.BASE_PATH, folder_name) if folder_name else self.current_case_folder
+            if not case_folder or not os.path.exists(case_folder):
+                case_folder = self.current_case_folder
+            if not case_folder or not os.path.exists(case_folder):
+                case_folder = str(path_utils.get_storage_path(
+                    f"{person_name}-工伤案件" if person_name else "未命名案件"
+                ))
+
+            # ── 4.1 医疗结论 / 受伤经过（有AI用AI判断，无AI用笔录提取）──
+            medical_conclusion = ''
+            injury_process = ''
+            if self.ai_service:
+                # 有AI：读本人笔录一次，同时生成「调查核实情况」段落 + 诊断结论
+                transcript_text = self._read_person_transcript_from_folder(case_folder)
+                if transcript_text:
+                    # 解析适用条款情形，供 AI 突出关键证据要素
+                    from case_classifier import CaseClassifier
+                    regulation = case_data.get('regulation', '')
+                    reg_desc = ""
+                    reg_elements = []
+                    for _idx, _reg in CaseClassifier.REGULATIONS.items():
+                        if _reg.get("text") == regulation:
+                            reg_desc = _reg.get("desc", "")
+                            reg_elements = _reg.get("elements", [])
+                            break
+                    result = self.ai_service.generate_injury_and_conclusion(
+                        transcript_text,
+                        regulation_text=regulation,
+                        regulation_desc=reg_desc,
+                        regulation_elements=reg_elements,
+                    )
+                    if result:
+                        injury_process = result.get("受伤经过", "") or ""
+                        medical_conclusion = result.get("诊断结论", "") or ""
+                if injury_process:
+                    self.set_data('本人受伤经过', injury_process, 'investigation')
+                    self._update_case_field(case_number, injury_process=injury_process)
+            else:
+                # 无AI：从本人笔录提取医疗结论，受伤经过留空
+                medical_conclusion = self._extract_medical_conclusion(case_folder)
+
+            # 诊断结论兜底：AI 未给出或为"无"时，用规则从本人笔录提取
+            if not medical_conclusion or medical_conclusion.strip() in ("无", "待核实", "【待核实】"):
+                fallback_conclusion = self._extract_medical_conclusion(case_folder)
+                if fallback_conclusion:
+                    medical_conclusion = fallback_conclusion
+
+            # 医疗结论写入数据模型
+            if medical_conclusion:
+                self.data_model.investigation['医院诊断'] = medical_conclusion
+                self.data_model.investigation['医疗结论'] = medical_conclusion
+
+            # ── 4.2 用JSON数据构建模板变量（{{受伤经过}}先不替换）──
             template_data = {
-                '公司名称': company_name,
+                '用人单位': company_name,
                 '申请人名称': applicant_name,
                 '本人姓名': person_name,
                 '本人性别': case_data.get('person_gender', ''),
                 '本人身份证号': case_data.get('id_card', ''),
-                '受伤经过': '',
-                '医疗结论': '',
+                '受伤经过': injury_process,
+                '医疗结论': medical_conclusion,
                 '引用条例': case_data.get('regulation', ''),
                 '申请时间': self._resolve_date_input(self.apply_time_edit.text()),
                 '受理时间': self._resolve_date_input(self.accept_time_edit.text()),
@@ -3288,19 +4430,32 @@ class MainWindow(QWidget, Ui_Form):
                     f"找不到模板文件:\n{template_path}")
                 return
 
-            # ── 5. 渲染模板（仅替换带 {{}} 外框的占位符，其它文字不动）──
-            word = DocxTemplate(template_path)
+            # ── 5. 预处理模板：勾选「认定工伤」方框（予以认定）──
+            import tempfile
+            import shutil
+            temp_template = os.path.join(tempfile.gettempdir(), '_temp_approval_table.docx')
+            shutil.copy2(template_path, temp_template)
+
+            from docx import Document as DocxEditor
+            doc_edit = DocxEditor(temp_template)
+            for table in doc_edit.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for p in cell.paragraphs:
+                            if "□认定工伤" in p.text:
+                                full = p.text.replace("□认定工伤", "☑认定工伤", 1)
+                                if p.runs:
+                                    p.runs[0].text = full
+                                    for r in p.runs[1:]:
+                                        r.text = ""
+                                break
+            doc_edit.save(temp_template)
+
+            # ── 6. 渲染模板（仅替换带 {{}} 外框的占位符）──
+            word = DocxTemplate(temp_template)
             word.render(template_data)
 
-            # ── 6. 确定案件文件夹并保存 ──
-            folder_name = case_data.get('folder_name', '')
-            case_folder = os.path.join(self.BASE_PATH, folder_name) if folder_name else self.current_case_folder
-            if not case_folder or not os.path.exists(case_folder):
-                case_folder = self.current_case_folder
-            if not case_folder or not os.path.exists(case_folder):
-                case_folder = str(path_utils.get_storage_path(
-                    f"{person_name}-工伤案件" if person_name else "未命名案件"
-                ))
+            # ── 6. 保存 ──
             os.makedirs(case_folder, exist_ok=True)
 
             file_name = f"{person_name}案件审批表.docx" if person_name else "案件审批表.docx"
@@ -3313,6 +4468,12 @@ class MainWindow(QWidget, Ui_Form):
 
             word.save(target_path)
             print(f"✅ 案件审批表已保存: {target_path}")
+
+            # ── 清理临时模板 ──
+            try:
+                os.remove(temp_template)
+            except Exception:
+                pass
 
             # ── 9. 打开 ──
             success, message = self.file_service.open_document(target_path)
@@ -3503,13 +4664,13 @@ class MainWindow(QWidget, Ui_Form):
 
             # 获取公司信息
             company_info = self.get_company_info()
-            company_name = company_info['公司名称']
+            company_name = company_info['用工单位']
             employer = company_info['用人单位']
             site = company_info['工地名称']
 
             # 更新公司数据
             if company_name:
-                self.set_data('公司名称', company_name, 'company')
+                self.set_data('用工单位', company_name, 'company')
             if employer:
                 self.set_data('用人单位', employer, 'company')
             if site:
@@ -3628,7 +4789,7 @@ class MainWindow(QWidget, Ui_Form):
 
                 self._set_status(f'文件保存成功，案本号: {case_number}', 'green')
 
-                self._add_case_to_index(
+                self._update_case_in_data(
                     case_number=case_number,
                     person_name=person_name,
                     folder_path=self.current_case_folder,
@@ -3656,55 +4817,34 @@ class MainWindow(QWidget, Ui_Form):
             import traceback
             traceback.print_exc()
 
-    def _add_case_to_index(self, case_number, person_name, folder_path, transcript_file):
-        """
-        添加案件到索引
-
-        Args:
-            case_number: 案本号
-            person_name: 受伤职工姓名
-            folder_path: 案件文件夹路径
-            transcript_file: 本人笔录文件名
-        """
+    def _update_case_in_data(self, case_number, person_name, folder_path, transcript_file):
+        """把保存笔录时产生的字段（文件夹名、笔录文件名等）写回 cases_data.json 的当前案件"""
         try:
-            # 确保导入datetime
             import datetime
 
-            print(f"📝 正在添加案件到索引: {case_number}")
+            print(f"📝 正在更新案件数据: {case_number}")
 
-            # 创建索引条目
-            from case_index import CaseIndexEntry
+            cases = self._load_cases_data()
+            case_obj = cases.get(case_number)
+            if case_obj is None:
+                print("⚠️ 案件数据中未找到该案本号，跳过更新")
+                return
 
-            case_entry = CaseIndexEntry(
-                case_number=case_number,
-                person_name=person_name,
-                id_card_last4=self.get_data('本人身份证号', '')[-4:] if self.get_data('本人身份证号', '') else 'xxxx',
-                id_card=self.get_data('本人身份证号', ''),
-                person_gender=self.get_data('本人性别', ''),
-                regulation=self.comboBox.currentText().strip(),
-                applicant_name=person_name if self.personal_application_checkbox.isChecked() else self.company_pane.currentText().strip(),
-                company_name=self.company_pane.currentText().strip(),
-                case_type="工亡" if self.death_case_checkbox.isChecked() else "工伤",
-                created_date=datetime.datetime.now().strftime("%Y-%m-%d"),
-                folder_name=os.path.basename(folder_path),
-                transcript_file=transcript_file,
-                updated_time=datetime.datetime.now().isoformat()
-            )
+            case_obj['folder_name'] = os.path.basename(folder_path)
+            case_obj['transcript_file'] = transcript_file
+            case_obj['case_type'] = "工亡" if self.death_case_checkbox.isChecked() else "工伤"
+            case_obj['updated_time'] = datetime.datetime.now().isoformat()
+            case_obj.setdefault('created_date', datetime.datetime.now().strftime("%Y-%m-%d"))
+            self._save_cases_data(cases)
 
-            # 添加到索引
-            success = self.case_index_manager.add_case(case_entry)
-
-            if success:
-                print(f"✅ 案件已添加到索引: {case_number}")
-                # 保存当前案本号，供后续使用
-                self.current_case_number = case_number
-                # 更新数据模型
-                self.set_data('案本号', case_number, 'case')
-            else:
-                print("⚠️ 案件索引添加失败，但不影响主要功能")
+            print(f"✅ 案件数据已更新: {case_number}")
+            # 保存当前案本号，供后续使用
+            self.current_case_number = case_number
+            # 更新数据模型
+            self.set_data('案本号', case_number, 'case')
 
         except Exception as e:
-            print(f"❌ 添加案件到索引失败（非致命错误）: {e}")
+            print(f"❌ 更新案件数据失败（非致命错误）: {e}")
             # 这里不抛出异常，避免影响主流程
 
     def _find_template_file(self, role_type, case_type, is_death_case, is_personal):
@@ -3759,21 +4899,21 @@ class MainWindow(QWidget, Ui_Form):
             print(f"⚠️ 清理临时文件失败: {e}")
 
     def get_company_info(self) -> Dict[str, str]:
-        """获取公司相关信息"""
-        company_name = self.company_pane.currentText().strip()
+        """获取公司相关信息（company_pane=用人单位，construction_company=用工单位）"""
         employer = self.construction_company.currentText().strip()
+        labor_unit = self.company_pane.currentText().strip()
         site = self.construction_plant.currentText().strip()
 
-        if not company_name:
-            company_name = self.get_data('公司名称', '')
         if not employer:
-            employer = self.get_data('用人单位', '')
+            employer = self.get_data('用工单位', '')
+        if not labor_unit:
+            labor_unit = self.get_data('用人单位', '')
         if not site:
             site = self.get_data('工地名称', '')
 
         return {
-            '公司名称': company_name,
-            '用人单位': employer,
+            '用工单位': employer,
+            '用人单位': labor_unit,
             '工地名称': site
         }
 
@@ -3793,7 +4933,7 @@ class MainWindow(QWidget, Ui_Form):
             })
 
         # 公司数据
-        current_data['公司名称'] = self.get_data('公司名称', '')
+        current_data['用工单位'] = self.get_data('用工单位', '')
 
         # 案件数据
         current_data['案本号'] = self.get_data('案本号', '')
@@ -3807,7 +4947,7 @@ class MainWindow(QWidget, Ui_Form):
         """确保模板所需的所有字段都存在"""
         required_fields = [
             '当前时期', '本人年龄', '本人性别', '本人姓名',
-            '本人身份证号', '本人身份证地址', '本人手机号', '公司名称'
+            '本人身份证号', '本人身份证地址', '本人手机号', '用工单位'
         ]
 
         for field in required_fields:
@@ -3818,8 +4958,8 @@ class MainWindow(QWidget, Ui_Form):
                     data_key = field if field.startswith('本人') else f'本人{field}'
                     value = self.data_model.basic_info.get(data_key, '')
 
-                elif field == '公司名称':
-                    value = self.data_model.company_info.get('公司名称', '')
+                elif field == '用工单位':
+                    value = self.data_model.company_info.get('用工单位', '')
 
                 elif field == '当前时期':
                     current_date = variables.get('当前日期', _date_now())
@@ -3843,8 +4983,8 @@ class MainWindow(QWidget, Ui_Form):
 
     def init_comboboxes(self):
         """初始化所有组合框"""
-        self.init_combobox(self.company_pane, self.items_list)
-        self.init_combobox(self.construction_company, self.items_list1)
+        self.init_combobox(self.company_pane, self.items_list1)
+        self.init_combobox(self.construction_company, self.items_list)
         self.init_combobox(self.construction_plant, self.items_list2)
 
         self.company_pane.setCurrentIndex(-1)
@@ -3852,14 +4992,14 @@ class MainWindow(QWidget, Ui_Form):
         self.construction_plant.setCurrentIndex(-1)
 
     def company(self):
-        """更新公司信息"""
-        company_name = self.company_pane.currentText().strip()
-        self.set_data('公司名称', company_name, 'company')
+        """更新用人单位信息（company_pane 现为用人单位）"""
+        employer_name = self.company_pane.currentText().strip()
+        self.set_data('用人单位', employer_name, 'company')
 
     def sync_employer_to_dict(self):
-        """更新用人单位信息"""
-        employer_name = self.construction_company.currentText().strip()
-        self.set_data('用人单位', employer_name, 'company')
+        """更新用工单位信息（construction_company 现为用工单位）"""
+        company_name = self.construction_company.currentText().strip()
+        self.set_data('用工单位', company_name, 'company')
 
     def c_plant(self):
         """更新工地名称信息"""
@@ -3956,11 +5096,11 @@ class MainWindow(QWidget, Ui_Form):
                     self.set_data('案本号', case_num, 'case')
 
             if role == "法人":
-                company_name = self.get_data('公司名称', '')
+                company_name = self.get_data('用工单位', '')
                 if not company_name:
                     company_name = self.company_pane.currentText().strip()
                     if company_name:
-                        self.set_data('公司名称', company_name, 'company')
+                        self.set_data('用工单位', company_name, 'company')
 
         except Exception as e:
             import traceback
@@ -4041,15 +5181,15 @@ class MainWindow(QWidget, Ui_Form):
                 f.write(f"身份证地址：{self.textEdit.toPlainText().strip()}\n")
                 f.write(f"电话：{self.lineEdit_4.text().strip()}\n")
                 f.write(f"岗位：{self.lineEdit_5.text().strip()}\n")
-                f.write(f"公司：{company_info.get('公司名称', '')}\n")
+                f.write(f"公司：{company_info.get('用工单位', '')}\n")
                 f.write(f"用人单位：{company_info.get('用人单位', '')}\n")
                 f.write(f"工地名称：{company_info.get('工地名称', '')}\n")
                 f.write(f"案件陈述：{self.statement_edit.toPlainText().strip() if hasattr(self, 'statement_edit') else ''}\n")
                 f.write(f"保存时间：{_date_now()}{_time_now()}\n")
             print(f"📄 基本信息已保存: {info_file}")
 
-            # 7. 添加到索引
-            self._add_case_to_index(
+            # 7. 更新案件数据
+            self._update_case_in_data(
                 case_number=case_number,
                 person_name=person_name,
                 folder_path=self.current_case_folder,
@@ -4423,256 +5563,114 @@ class MainWindow(QWidget, Ui_Form):
         self._set_status('已开始新案件', 'green')
 
     def smart_search_cases(self):
-        """
-        智能搜索案件 - 点击 pushButton_6 时调用
-        使用案本号中的关键词模糊搜索匹配的文件夹
-        """
+        """按案本号在 cases_data.json 中模糊搜索，并回填主界面"""
         try:
-            # 1. 获取搜索关键词（优先用案本号，其次用本人姓名）
             keyword = self.lineEdit_2.text().strip()
             if not keyword:
                 keyword = self.get_data("本人姓名", "")
             if not keyword:
                 keyword = self.name_pane.text().strip()
             if not keyword:
-                QMessageBox.warning(self, "提示", "请输入案本号或受伤职工姓名")
+                QMessageBox.warning(self, "提示", "请输入案本号进行搜索")
                 return
 
-            # 2. 模糊搜索案件
-            matched_cases = self.file_service.search_cases_fuzzy(
-                self.BASE_PATH, keyword
-            )
-
-            if not matched_cases:
-                QMessageBox.information(self, "提示",
-                                        f"未找到与'{keyword}'相关的案件")
+            cases = self._load_cases_data()  # {case_id: case_obj}
+            if not cases:
+                QMessageBox.information(self, "提示", "还没有保存任何案件数据")
                 return
 
-            # 3. 根据结果数量处理
-            if len(matched_cases) == 1:
-                self._select_case_automatically(matched_cases[0])
+            # 模糊匹配：案本号包含关键字
+            kw = keyword.lower()
+            matched = [(cid, obj) for cid, obj in cases.items()
+                       if kw in str(cid).lower()]
+
+            if not matched:
+                QMessageBox.information(self, "提示", f"未找到案本号包含「{keyword}」的案件")
+                return
+
+            if len(matched) == 1:
+                self._load_case_to_form(matched[0][1])
             else:
-                self._show_case_selection_dialog(matched_cases, keyword)
+                self._show_case_search_dialog(matched)
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"搜索失败: {str(e)}")
             import traceback
             traceback.print_exc()
 
-    def _select_case_automatically(self, case_info: Dict[str, Any]):
-        """自动选择单个案件"""
-        # 设置当前文件夹
-        self.current_case_folder = case_info['folder_path']
-        self.current_person_name = case_info['person_name']
+    def _load_case_to_form(self, case_obj: Dict[str, Any]):
+        """把单个案件 JSON 回填主界面与数据模型"""
+        # 切回本人角色再回填
+        self.radioButton.setChecked(True)
+        self.clear_role_fields()
+        self._apply_case_object(case_obj)
+        self.current_case_id = str(case_obj.get('case_id', ''))
+        self._set_status(f"已加载案件：{self.current_case_id}", 'green')
+        QMessageBox.information(
+            self, "加载成功",
+            f"已加载案件数据：\n案本号：{self.current_case_id}\n姓名：{case_obj.get('name', '')}"
+        )
 
-        # 更新案本号显示
-        self.lineEdit_2.setText(case_info.get('case_number', ''))
-        self.set_data('本人姓名', case_info['person_name'], 'basic')
-
-        # 显示提示
-        info = (f"已关联到案件: {case_info['case_number']}\n"
-                f"创建时间: {case_info['created_date']}\n"
-                f"已有文件: {case_info['file_count']}个")
-
-        QMessageBox.information(self, "关联成功", info)
-
-        # 更新状态标签
-        self._set_status(f"已关联: {case_info['case_number']}", 'green')
-
-    def _show_case_selection_dialog(self, cases: List[Dict], person_name: str):
-        """显示案件选择对话框"""
+    def _show_case_search_dialog(self, matched):
+        """弹出窗口列出匹配案件供选择"""
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"选择案件 - {person_name} ({len(cases)}个)")
-        dialog.resize(600, 400)
+        dialog.setWindowTitle(f"选择案件（{len(matched)} 条）")
+        dialog.resize(720, 460)
 
         layout = QVBoxLayout()
-
-        # 标题
-        title = QLabel(f"找到{len(cases)}个'{person_name}'的案件，请选择:")
+        title = QLabel(f"找到 {len(matched)} 条匹配案件，请选择：")
         layout.addWidget(title)
 
-        # 案件列表表格
         table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(['选择', '案本号', '创建日期', '文件数量', '已有本人笔录'])
-        table.setRowCount(len(cases))
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(['案本号', '姓名', '用人单位', '拟用条例'])
+        table.setRowCount(len(matched))
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
 
-        # 单选按钮组
-        button_group = QButtonGroup()
-
-        for i, case in enumerate(cases):
-            # 单选按钮
-            radio_btn = QRadioButton()
-            if i == 0:  # 默认选择第一个
-                radio_btn.setChecked(True)
-            button_group.addButton(radio_btn, i)
-
-            # 案本号
-            case_number = QTableWidgetItem(case['case_number'])
-            case_number.setFlags(case_number.flags() ^ Qt.ItemIsEditable)
-
-            # 创建日期
-            created_date = QTableWidgetItem(case['created_date'])
-
-            # 文件数量
-            file_count = QTableWidgetItem(str(case['file_count']))
-
-            # 是否有本人笔录
-            has_person = QTableWidgetItem("✅ 有" if case['has_person'] else "❌ 无")
-
-            # 设置到表格
-            table.setCellWidget(i, 0, radio_btn)
-            table.setItem(i, 1, case_number)
-            table.setItem(i, 2, created_date)
-            table.setItem(i, 3, file_count)
-            table.setItem(i, 4, has_person)
+        for i, (case_id, case_obj) in enumerate(matched):
+            table.setItem(i, 0, QTableWidgetItem(str(case_id)))
+            table.setItem(i, 1, QTableWidgetItem(str(case_obj.get('name', ''))))
+            table.setItem(i, 2, QTableWidgetItem(str(case_obj.get('employer', ''))))
+            table.setItem(i, 3, QTableWidgetItem(str(case_obj.get('proposed_article', ''))))
 
         table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        if table.rowCount() > 0:
+            table.selectRow(0)
         layout.addWidget(table)
 
-        # 按钮区域
+        # 双击直接选择
+        table.cellDoubleClicked.connect(
+            lambda r, c: self._on_case_search_selected(matched, r, dialog)
+        )
+
         btn_layout = QHBoxLayout()
-
-        btn_select = QPushButton("选择")
-        btn_select.clicked.connect(lambda: self._on_case_selected(
-            cases, button_group.checkedId(), dialog
-        ))
-
-        btn_cancel = QPushButton("取消")
-        btn_cancel.clicked.connect(dialog.reject)
-
         btn_layout.addStretch()
-        btn_layout.addWidget(btn_select)
-        btn_layout.addWidget(btn_cancel)
-
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+        select_btn = QPushButton("选择")
+        select_btn.clicked.connect(
+            lambda: self._on_case_search_selected(matched, table.currentRow(), dialog)
+        )
+        btn_layout.addWidget(select_btn)
         layout.addLayout(btn_layout)
-        dialog.setLayout(layout)
 
+        dialog.setLayout(layout)
         dialog.exec_()
 
-    def _on_case_selected(self, cases: List[Dict], selected_index: int, dialog: QDialog):
-        """用户选择案件后的处理"""
-        if selected_index < 0:
-            QMessageBox.warning(dialog, "提示", "请先选择一个案件")
+    def _on_case_search_selected(self, matched, row: int, dialog: QDialog):
+        """用户选中某条案件后的处理"""
+        if row < 0 or row >= len(matched):
+            QMessageBox.warning(dialog, "提示", "请先选择一行")
             return
-
-        selected_case = cases[selected_index]
-
-        # 设置当前文件夹
-        self.current_case_folder = selected_case['folder_path']
-        self.current_person_name = selected_case['person_name']
-        self._load_witnesses()
-
-        # 更新案本号显示
-        self.lineEdit_2.setText(selected_case.get('case_number', ''))
-        self.set_data('本人姓名', selected_case['person_name'], 'basic')
-
+        case_obj = matched[row][1]
         dialog.accept()
+        self._load_case_to_form(case_obj)
 
-        # 显示成功消息
-        QMessageBox.information(self, "关联成功",
-                                f"已关联到案件: {selected_case['case_number']}")
-
-    # ========================================================================
-    # F2 测试数据轮换
-    # ========================================================================
-
-    def keyPressEvent(self, event):
-        """F2 键轮换测试数据"""
-        if event.key() == Qt.Key_F2:
-            self._cycle_test_data()
-        else:
-            super().keyPressEvent(event)
-
-    def _cycle_test_data(self):
-        """按 F2 切换到下一组测试数据"""
-        self._test_data_index = (self._test_data_index + 1) % len(TEST_DATA_PRESETS)
-        data = TEST_DATA_PRESETS[self._test_data_index]
-
-        print(f"\n{'='*50}")
-        print(f"F2 测试数据: {data['name']}")
-        print(f"{'='*50}")
-
-        # ── 角色单选按钮 ──
-        role_map = {"本人": self.radioButton, "证人": self.radioButton_2, "法人": self.radioButton_3}
-        for role_name, btn in role_map.items():
-            btn.setChecked(role_name == data["role"])
-        # 触发角色切换
-        self.clear_role_fields()
-
-        # ── 案例类型复选框 ──
-        self.death_case_checkbox.setChecked(data["deathCaseCheckbox"])
-        self.personal_application_checkbox.setChecked(data["personalApplicationCheckbox"])
-        self.on_case_type_changed()
-
-        # ── 基本信息输入框 ──
-        self.name_pane.setText(data["name_pane"])
-        self.idnumer_pane.setText(data["idnumer_pane"])
-        self.textEdit.setPlainText(data["textEdit"])
-        self.lineEdit_4.setText(data["lineEdit_4"])
-        self.lineEdit_5.setText(data["lineEdit_5"])
-
-        # ── 条例下拉框 ──
-        self.comboBox.setCurrentIndex(data["comboBox"])
-
-        # ── 公司下拉框 ──
-        self._set_combo_or_type(self.company_pane, data["company_pane"])
-        self._set_combo_or_type(self.construction_company, data["construction_company"])
-        self._set_combo_or_type(self.construction_plant, data["construction_plant"])
-
-        # ── 自动计算年龄和性别 ──
-        role = self.get_current_role_type()
-        self.on_id_input_finished()
-
-        # ── 本人角色自动生成案本号 ──
-        if role == "本人":
-            self._on_name_pane_changed()
-
-        # ── 右侧面板（同案沿用） ──
-        # 同一受伤职工 → 沿用上一组的案件陈述和材料分类
-        # 不同受伤职工 → 用新预设数据覆盖
-        # 同案检测改用本人姓名（data_model 或 name_pane）
-        current_worker = self.get_data('本人姓名', '') or data.get("name_pane", "")
-        prev_worker = getattr(self, '_prev_injured_worker', None)
-        is_same_case = (prev_worker is not None and current_worker == prev_worker)
-
-        if hasattr(self, 'statement_edit'):
-            if is_same_case:
-                # 同案：保持案件陈述不变，只检查是否为空
-                if not self.statement_edit.toPlainText().strip() and data.get("statement_edit"):
-                    self.statement_edit.setPlainText(data.get("statement_edit", ""))
-                print(f"📋 同案沿用案件陈述（{current_worker}）")
-            else:
-                self.statement_edit.setPlainText(data.get("statement_edit", ""))
-
-        if hasattr(self, 'material_list'):
-            if is_same_case:
-                # 同案：保持材料分类不变
-                if self.material_list.get_materials() == [] and data.get("materials"):
-                    self.material_list.set_materials(data.get("materials", []))
-                print(f"📋 同案沿用材料分类（{current_worker}）")
-            else:
-                self.material_list.set_materials(data.get("materials", []))
-
-        self._prev_injured_worker = current_worker
-
-        # ── 状态提示 ──
-        label = (f"[测试 {self._test_data_index + 1}/{len(TEST_DATA_PRESETS)}] "
-                 f"{data['name']}  |  F2=下一个")
-        self._set_status(label, 'green')
-        print(f"OK 测试数据已填充: {data['name']}")
-
-    def _set_combo_or_type(self, combobox, text):
-        """设置下拉框的值：如果存在则选中，否则直接输入"""
-        if not text:
-            combobox.setCurrentIndex(-1)
-            return
-        idx = combobox.findText(text)
-        if idx >= 0:
-            combobox.setCurrentIndex(idx)
-        else:
-            combobox.setCurrentIndex(-1)
-            combobox.setEditText(text)
 
 
 if __name__ == "__main__":

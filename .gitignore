@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.idea/
+
+# 备份 / 临时文件
+*.bak
+*.bak2
+*.part
+_backup_*/
+tmp_*.txt
+
+# 含密钥的本地配置（不要提交）
+users_api.json
+api_configs/

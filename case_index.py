@@ -22,6 +22,8 @@ class CaseIndexEntry:
     person_gender: str = ""  # 本人性别
     regulation: str = ""  # 引用条例
     applicant_name: str = ""  # 申请人名称
+    conclusion: str = ""  # 认定结论（予以认定/不予认定）
+    injury_process: str = ""  # 本人受伤经过（AI规范化）
     company_name: str = ""  # 公司名称
     case_type: str = ""  # 案件类型（普通/工亡等）
     created_date: str = ""  # 创建日期
@@ -100,16 +102,21 @@ class CaseIndexManager:
             return False
 
     def _create_backup(self):
-        """创建备份"""
-        if self.index_file.exists():
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = self.backup_dir / f"index_backup_{timestamp}.json"
+        """创建备份（失败不影响主流程）"""
+        try:
+            if self.index_file.exists():
+                # 确保备份目录存在
+                self.backup_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_file = self.backup_dir / f"index_backup_{timestamp}.json"
 
-            import shutil
-            shutil.copy2(self.index_file, backup_file)
+                import shutil
+                shutil.copy2(self.index_file, backup_file)
 
-            # 清理旧备份（最多保留5个）
-            self._cleanup_old_backups()
+                # 清理旧备份（最多保留5个）
+                self._cleanup_old_backups()
+        except Exception as e:
+            print(f"[WARN] 创建索引备份失败（忽略）: {e}")
 
     def _cleanup_old_backups(self, max_backups: int = 5):
         """清理旧备份"""
@@ -200,6 +207,16 @@ class CaseIndexManager:
     def find_by_case_number(self, case_number: str) -> Optional[Dict[str, Any]]:
         """按案本号查找案件"""
         return self.index["cases"].get(case_number)
+
+    def update_case(self, case_number: str, **updates) -> bool:
+        """更新案件字段"""
+        if case_number not in self.index["cases"]:
+            print(f"[WARN] 案件不存在，无法更新: {case_number}")
+            return False
+        self.index["cases"][case_number].update(updates)
+        self._save_index()
+        print(f"[OK] 案件已更新: {case_number} 字段={list(updates.keys())}")
+        return True
 
     def find_by_person_name(self, person_name: str) -> List[Dict[str, Any]]:
         """按姓名查找案件"""
