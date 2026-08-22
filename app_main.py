@@ -21,9 +21,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont
 
 from ui_main_window import Ui_Form
-from file_service import FileService
-from data_service import DataService
-from template_service import TemplateService, TemplateVariableManager
+from services import FileService, DataService, TemplateService, TemplateVariableManager
 from ai_service import AIService
 from config_service import ConfigService
 from path_utils import path_utils
@@ -1806,23 +1804,10 @@ class MainWindow(QWidget, Ui_Form):
 
             template_data = self._build_unified_template_data(case_obj)
 
-            from docx import Document
-            doc = Document(template_path)
-            # docxtpl 对跨 run 的中文占位符替换不可靠，改用段落全文手动替换
-            for para in doc.paragraphs:
-                text = para.text
-                if '{{' not in text:
-                    continue
-                new_text = text
-                for key, value in template_data.items():
-                    new_text = new_text.replace('{{' + key + '}}', str(value))
-                if new_text != text:
-                    if para.runs:
-                        para.runs[0].text = new_text
-                        for run in para.runs[1:]:
-                            run.text = ''
-                    else:
-                        para.add_run(new_text)
+            # ── 1.1 用 docxtpl 渲染占位符（保留占位符原有格式）──
+            from docxtpl import DocxTemplate
+            doc = DocxTemplate(template_path)
+            doc.render(template_data)
 
             # ── 2. 定位「答：听清楚了，不申请回避。」锚点 ──
             anchor_index = None
@@ -3902,11 +3887,11 @@ class MainWindow(QWidget, Ui_Form):
             # 使用 path_utils 的数据路径
             from path_utils import path_utils
 
-            data_dir = path_utils.get_data_path("")
-            print(f"🔍 数据目录: {data_dir}")
+            doc_template_dir = path_utils.get_document_template_path("")
+            print(f"🔍 文书模板目录: {doc_template_dir}")
 
-            # 用工单位 - 使用数据目录
-            company_file = str(data_dir / '用工单位汇总.xlsx')
+            # 用工单位 - 使用文书模板目录
+            company_file = str(path_utils.get_document_template_path('用工单位汇总.xlsx'))
             print(f"🔍 用工单位文件: {company_file}")
 
             if os.path.exists(company_file):
@@ -3930,8 +3915,8 @@ class MainWindow(QWidget, Ui_Form):
                 except Exception as e:
                     print(f"❌ 创建用工单位文件失败: {e}")
 
-            # 用人单位 - 使用数据目录
-            employer_file = str(data_dir / '用人单位汇总.xlsx')
+            # 用人单位 - 使用文书模板目录
+            employer_file = str(path_utils.get_document_template_path('用人单位汇总.xlsx'))
             print(f"🔍 用人单位文件: {employer_file}")
 
             if os.path.exists(employer_file):
@@ -3952,8 +3937,8 @@ class MainWindow(QWidget, Ui_Form):
                 except Exception as e:
                     print(f"❌ 创建用人单位文件失败: {e}")
 
-            # 工地名称 - 使用数据目录
-            site_file = str(data_dir / '工地名称汇总.xlsx')
+            # 工地名称 - 使用文书模板目录
+            site_file = str(path_utils.get_document_template_path('工地名称汇总.xlsx'))
             print(f"🔍 工地名称文件: {site_file}")
 
             if os.path.exists(site_file):
@@ -5219,7 +5204,7 @@ class MainWindow(QWidget, Ui_Form):
             print(classifier.to_summary(c))
 
             # 2. 构建 System Prompt（仅需角色）
-            from transcript_prompt import (
+            from case_classifier import (
                 build_system_prompt, build_user_prompt, OUTPUT_FORMAT_INSTRUCTION
             )
             system_prompt = build_system_prompt(role)
