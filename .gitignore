@@ -20,3 +20,6 @@ tmp_*.txt
 # 含密钥的本地配置（不要提交）
 users_api.json
 api_configs/
+
+# 运行期本地配置（机器相关，含桌面路径等，不要提交）
+config/

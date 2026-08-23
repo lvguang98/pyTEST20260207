@@ -541,7 +541,8 @@ class TemplateVariableManager:
                               company: str, employer: str, site: str,
                               name: str, position: str, id_address: str = "") -> str:
         """生成自我介绍（带缓存）"""
-        cache_key = f"{role}_{name}_{company}_{employer}_{site}"
+        # 钥匙覆盖所有入参，岗位/身份证地址变化时缓存也会失效
+        cache_key = f"{role}_{name}_{company}_{employer}_{site}_{position}_{id_address}"
 
         if cache_key in self.introduction_cache:
             return self.introduction_cache[cache_key]
@@ -570,9 +571,11 @@ class TemplateVariableManager:
             if employer:
                 parts.append(f"被指派到{employer}")
                 if site:
-                    parts.append(f"承建的{site}工地")
+                    site_label = site if site.endswith("工地") else f"{site}工地"
+                    parts.append(f"承建的{site_label}")
             elif site:
-                parts.append(f"被指派到{site}工地")
+                site_label = site if site.endswith("工地") else f"{site}工地"
+                parts.append(f"被指派到{site_label}")
         else:
             parts.append("")
 
@@ -601,9 +604,11 @@ class TemplateVariableManager:
             if employer:
                 parts.append(f"被指派到{employer}")
                 if site:
-                    parts.append(f"承建的{site}工地")
+                    site_label = site if site.endswith("工地") else f"{site}工地"
+                    parts.append(f"承建的{site_label}")
             elif site:
-                parts.append(f"被指派到{site}工地")
+                site_label = site if site.endswith("工地") else f"{site}工地"
+                parts.append(f"被指派到{site_label}")
         else:
             parts.append("")
 
@@ -648,12 +653,7 @@ class TemplateVariableManager:
 
     def collect_variables(self, role: str, case_type: int,
                           has_employer: bool, has_site: bool) -> Dict[str, Any]:
-        """收集所有模板变量"""
-        cache_key = f"{role}_{case_type}_{has_employer}_{has_site}"
-
-        if cache_key in self.variables_cache:
-            return self.variables_cache[cache_key]
-
+        """收集所有模板变量（每次现组，避免缓存命中返回旧数据）"""
         # 基础数据
         variables = self.data.to_template_dict()
 
@@ -690,8 +690,8 @@ class TemplateVariableManager:
 
         # 用工情况描述
         if has_employer:
-            employer = self.data.company_info.get('用人单位', '')
-            variables['用工情况'] = f"有用工单位：{employer}" if employer else "无用工单位"
+            unit = self.data.company_info.get('用工单位', '')
+            variables['用工情况'] = f"有用工单位：{unit}" if unit else "无用工单位"
         else:
             variables['用工情况'] = "无用工单位"
 
@@ -702,8 +702,6 @@ class TemplateVariableManager:
         else:
             variables['工地情况'] = "无特定工地"
 
-        # 缓存结果
-        self.variables_cache[cache_key] = variables
         return variables
 
 

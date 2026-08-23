@@ -204,8 +204,8 @@ class ConfigService:
                 # 打包后的应用
                 base_dir = os.path.dirname(sys.executable)
             else:
-                # 开发环境
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                # 开发环境：__file__ 所在目录即应用根目录
+                base_dir = os.path.dirname(os.path.abspath(__file__))
 
             self.config_dir = os.path.join(base_dir, "config")
         else:
