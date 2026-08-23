@@ -279,6 +279,68 @@ class AIService:
             print(f"❌ 生成失败: {e}")
             return None
 
+    def analyze_approval_transcripts(self, transcripts_text: str,
+                                     case_id: str = "",
+                                     regulation_text: str = "",
+                                     regulation_desc: str = "",
+                                     regulation_elements=None):
+        """
+        AI 分析全部谈话笔录（本人/证人/法人）→ 判断认定/不予认定偏向。
+
+        Returns:
+            {"偏向": "认定"/"不予认定", "分析": str, "关键理由": [str], "诊断结论": str}
+            失败返回 None
+        """
+        try:
+            if not transcripts_text or not transcripts_text.strip():
+                return None
+
+            from prompt_manager import load_prompt
+            prompt = load_prompt('approval_analysis')
+            elements = "、".join(regulation_elements) if regulation_elements else ""
+            prompt = prompt.replace('{{案本号}}', str(case_id or ""))
+            prompt = prompt.replace('{{拟用条例}}', str(regulation_text or ""))
+            prompt = prompt.replace('{{法律要件}}', elements)
+            prompt = prompt.replace('{{全部笔录}}', transcripts_text[:6000])
+
+            headers = {
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json'
+            }
+            data = {
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 2000,
+                "response_format": {"type": "json_object"},
+            }
+
+            print(f"📤 发送审批表分析请求，笔录 {len(transcripts_text)} 字符")
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=120,
+            )
+
+            if response.status_code == 200:
+                content = response.json()["choices"][0]["message"]["content"]
+                parsed = self._parse_json_response(content)
+                if isinstance(parsed, dict) and '偏向' in parsed:
+                    print(f"✅ 审批表分析完成，偏向: {parsed.get('偏向')}")
+                    return parsed
+                return None
+            else:
+                print(f"❌ 审批表分析失败，状态码: {response.status_code}")
+                return None
+
+        except requests.exceptions.Timeout:
+            print("⏰ 审批表分析请求超时")
+            return None
+        except Exception as e:
+            print(f"❌ 审批表分析异常: {e}")
+            return None
+
     def generate_transcript(self, system_prompt: str, user_prompt: str) -> dict:
         """
         调用 DeepSeek API 生成谈话笔录问答内容。

@@ -1034,6 +1034,92 @@ class CaseDataReviewDialog(QDialog):
         return self._case_obj
 
 
+class ApprovalDecisionDialog(QDialog):
+    """案件审批表 AI 分析结果对话框：认定工伤 / 不予认定工伤 / 保存"""
+
+    def __init__(self, analysis: dict, parent=None):
+        super().__init__(parent)
+        self.choice = "保存"
+        self._build_ui(analysis)
+
+    def _build_ui(self, analysis: dict):
+        self.setWindowTitle("🔍 AI 分析结果")
+        self.resize(760, 560)
+        self.setMinimumSize(640, 480)
+
+        layout = QVBoxLayout(self)
+
+        bias = analysis.get("偏向", "")
+        bias_label = QLabel(f"AI 倾向：{bias}" if bias else "AI 倾向：未知")
+        bias_label.setStyleSheet("font-size: 15px; font-weight: bold; padding: 4px;")
+        layout.addWidget(bias_label)
+
+        # 页签：综合分析 / 不予认定理由 / 诊断结论
+        tab_widget = QTabWidget()
+
+        tab1 = QWidget()
+        t1 = QVBoxLayout(tab1)
+        analysis_edit = QTextEdit()
+        analysis_edit.setReadOnly(True)
+        analysis_edit.setPlainText(analysis.get("分析", ""))
+        t1.addWidget(analysis_edit)
+        tab_widget.addTab(tab1, "综合分析")
+
+        tab2 = QWidget()
+        t2 = QVBoxLayout(tab2)
+        reason_edit = QTextEdit()
+        reason_edit.setReadOnly(True)
+        reasons = analysis.get("关键理由", []) or []
+        reason_edit.setPlainText("\n".join(f"• {r}" for r in reasons))
+        t2.addWidget(reason_edit)
+        tab_widget.addTab(tab2, "不予认定理由")
+
+        tab3 = QWidget()
+        t3 = QVBoxLayout(tab3)
+        diag_edit = QTextEdit()
+        diag_edit.setReadOnly(True)
+        diag_edit.setPlainText(analysis.get("诊断结论", ""))
+        t3.addWidget(diag_edit)
+        tab_widget.addTab(tab3, "诊断结论")
+
+        layout.addWidget(tab_widget, 1)
+
+        # 三个按钮
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(lambda: self._done("保存"))
+        btn_row.addWidget(save_btn)
+
+        no_btn = QPushButton("不予认定工伤")
+        no_btn.setStyleSheet(
+            "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; "
+            "padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #c0392b; }"
+        )
+        no_btn.clicked.connect(lambda: self._done("不予认定"))
+        btn_row.addWidget(no_btn)
+
+        yes_btn = QPushButton("认定工伤")
+        yes_btn.setStyleSheet(
+            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; "
+            "padding: 6px 20px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #219150; }"
+        )
+        yes_btn.clicked.connect(lambda: self._done("认定"))
+        btn_row.addWidget(yes_btn)
+
+        layout.addLayout(btn_row)
+
+    def _done(self, choice: str):
+        self.choice = choice
+        self.accept()
+
+    def get_choice(self) -> str:
+        return self.choice
+
+
 class MainWindow(QWidget, Ui_Form):
 
     def __init__(self, parent=None, *args, **kwargs):
@@ -1048,14 +1134,6 @@ class MainWindow(QWidget, Ui_Form):
         self.label_10.setText("案本号：")
         self.lineEdit_2.setGeometry(80, 130, 180, 20)
         self.lineEdit_2.setPlaceholderText("输入本人姓名后自动生成")
-
-        # 「认定工伤」是/否 勾选框（常驻界面，点「案件审批表」时才读取）
-        self.confirm_injury_checkbox = QCheckBox("认定工伤", self)
-        self.confirm_injury_checkbox.setGeometry(315, 90, 100, 31)
-        self.confirm_injury_checkbox.setChecked(True)
-        self.confirm_injury_checkbox.setToolTip(
-            "勾选=认为本案符合条例、可认定工伤；取消勾选=认为本案不可认定工伤"
-        )
 
         # 输入本人姓名后自动生成案本号
         self.name_pane.editingFinished.connect(self._on_name_pane_changed)
@@ -1149,9 +1227,6 @@ class MainWindow(QWidget, Ui_Form):
         # 连接AI审查按钮
         self.pushButton_ai_review.clicked.connect(self.ai_review_document)
         self._reconnect_approval_button()
-        # 案件审批预览按钮
-        self.pushButton_9.setText("案件审批预览")
-        self.pushButton_9.clicked.connect(self.preview_approval)
         # 谈话通知书按钮连接
         self.pushButton_12.clicked.connect(self.on_pushButton_12_clicked)
 
@@ -1270,6 +1345,7 @@ class MainWindow(QWidget, Ui_Form):
             'regulation': regulation_short,
             'apply_time': self._resolve_date_input(self.apply_time_edit.text()) if hasattr(self, 'apply_time_edit') else '',
             'accept_time': self._resolve_date_input(self.accept_time_edit.text()) if hasattr(self, 'accept_time_edit') else '',
+            'visit_time': self._resolve_date_input(self.visit_time_edit.text()) if hasattr(self, 'visit_time_edit') else '',
             'name': self.get_data('本人姓名', '') or self.name_pane.text().strip(),
             'gender': self.get_data('本人性别', '') or self.lineEdit.text().strip(),
             'age': str(self.get_data('本人年龄', '') or self.age_pane.text().strip()),
@@ -1343,6 +1419,8 @@ class MainWindow(QWidget, Ui_Form):
             self.apply_time_edit.setText(str(case_obj.get('apply_time', '')))
         if hasattr(self, 'accept_time_edit'):
             self.accept_time_edit.setText(str(case_obj.get('accept_time', '')))
+        if hasattr(self, 'visit_time_edit'):
+            self.visit_time_edit.setText(str(case_obj.get('visit_time', '')))
         self._save_date_inputs()
 
         # 本人信息
@@ -1528,6 +1606,7 @@ class MainWindow(QWidget, Ui_Form):
             "site": data.get('site', ''),
             "apply_time": data.get('apply_time', ''),
             "accept_time": data.get('accept_time', ''),
+            "visit_time": data.get('visit_time', ''),
             "proposed_article": data.get('regulation', ''),
             "proposed_article_elements": _regulation_elements(data.get('regulation', '')),
             # ── 本人（一套完整数据）──
@@ -2551,137 +2630,6 @@ class MainWindow(QWidget, Ui_Form):
         print(f"✅ 解析结果: 审查结果长度={len(result['审查结果'])}, 问题数量={len(result['缺失问题'])}")
         return result
 
-    def preview_approval(self):
-        """案件审批预览 - 使用模板直接生成预览文档，无需AI"""
-        try:
-            # ── 1. 获取受伤职工姓名 ──
-            person_name = self.name_pane.text().strip()
-            if not person_name:
-                person_name = self.get_data('本人姓名', '')
-            if not person_name:
-                self._set_status('请先输入本人姓名', 'red')
-                QMessageBox.warning(self, "提示", "请先输入受伤职工姓名")
-                return
-
-            # ── 2. 收集模板数据 ──
-            company_name = self.company_pane.currentText().strip()
-            if not company_name:
-                company_name = self.get_data('用人单位', '')
-
-            site = self.construction_plant.currentText().strip()
-            gender = self.lineEdit.text().strip()
-            id_number = self.idnumer_pane.text().strip()
-            regulation = self.comboBox.currentText().strip()
-
-            # 受伤经过 - 优先取案件陈述，其次取本人笔录文本
-            injury_desc = ''
-            if hasattr(self, 'statement_edit'):
-                injury_desc = self.statement_edit.toPlainText().strip()
-            if not injury_desc:
-                injury_desc = '详见谈话笔录'
-
-            current_date = _date_now()
-            current_time = _time_now()
-
-            template_data = {
-                '用人单位': company_name,
-                '本人姓名': person_name,
-                '本人性别': gender,
-                '本人身份证号': id_number,
-                '受伤经过': injury_desc,
-                '医疗结论': '【待补充】',
-                '引用条例': regulation,
-                '申请时间': self._resolve_date_input(self.apply_time_edit.text()),
-                '受理时间': self._resolve_date_input(self.accept_time_edit.text()),
-            }
-
-            # ── 3. 获取模板路径 ──
-            template_path = str(path_utils.get_document_template_path('工伤案件审批表（模板）.docx'))
-            if not os.path.exists(template_path):
-                self._set_status('模板文件不存在', 'red')
-                QMessageBox.critical(self, "错误", f"找不到模板文件:\n{template_path}")
-                return
-
-            # ── 4. 预处理模板副本（为日期标签单元格添加占位符） ──
-            import tempfile
-            import shutil
-            temp_dir = tempfile.gettempdir()
-            temp_template = os.path.join(temp_dir, '_temp_approval_preview.docx')
-            shutil.copy2(template_path, temp_template)
-
-            try:
-                from docx import Document as DocxEditor
-                doc_edit = DocxEditor(temp_template)
-                for table in doc_edit.tables:
-                    for row in table.rows:
-                        for cell in row.cells:
-                            for p in cell.paragraphs:
-                                text = p.text.strip()
-                                if text == '申请时间' and '{{' not in text:
-                                    # 在标签后追加占位符
-                                    if p.runs:
-                                        p.runs[0].text = text + '{{申请时间}}'
-                                    else:
-                                        p.add_run(text + '{{申请时间}}')
-                                elif text == '受理时间' and '{{' not in text:
-                                    if p.runs:
-                                        p.runs[0].text = text + '{{受理时间}}'
-                                    else:
-                                        p.add_run(text + '{{受理时间}}')
-                doc_edit.save(temp_template)
-            except Exception as e:
-                print(f"⚠️ 预处理模板日期字段失败（将使用原模板）: {e}")
-
-            # ── 5. 渲染模板 ──
-            from docxtpl import DocxTemplate
-            word = DocxTemplate(temp_template)
-            word.render(template_data)
-
-            # ── 6. 确保有案件文件夹 ──
-            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                try:
-                    self.current_case_folder = os.path.join(
-                        self.file_service.base_path,
-                        f"{person_name}-工伤案件"
-                    )
-                except Exception:
-                    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-                    self.current_case_folder = os.path.join(
-                        desktop, "工伤助手存储案本", f"{person_name}-工伤案件"
-                    )
-                os.makedirs(self.current_case_folder, exist_ok=True)
-
-            # ── 7. 保存文件 ──
-            file_name = f"{person_name}案件审批预览.docx"
-            target_path = os.path.join(self.current_case_folder, file_name)
-            counter = 2
-            while os.path.exists(target_path):
-                file_name = f"{person_name}案件审批预览({counter}).docx"
-                target_path = os.path.join(self.current_case_folder, file_name)
-                counter += 1
-
-            word.save(target_path)
-            print(f"✅ 案件审批预览已保存: {target_path}")
-
-            # ── 8. 清理临时模板 ──
-            try:
-                os.remove(temp_template)
-            except Exception:
-                pass
-
-            # ── 9. 打开文件 ──
-            success, message = self.file_service.open_document(target_path)
-            if success:
-                self._set_status('案件审批预览已生成', 'green')
-            else:
-                self._set_status(f'预览已生成，打开失败: {message}', 'orange')
-
-        except Exception as e:
-            print(f"❌ 生成案件审批预览异常: {e}")
-            import traceback
-            traceback.print_exc()
-            self._set_status(f'生成预览失败: {str(e)}', 'red')
-
     def _reconnect_approval_button(self):
         """重新连接案件审批表按钮 (pushButton_11)"""
         try:
@@ -3087,8 +3035,8 @@ class MainWindow(QWidget, Ui_Form):
         RIGHT_PANEL_X = 478     # 右侧面板起始 x
         RIGHT_PANEL_W = 382     # 右侧面板宽度
 
-        # --- 1. 调整窗口大小（左侧 470 + 右侧 400 = 870） ---
-        WIN_W, WIN_H = 870, 740
+        # --- 1. 调整窗口大小（左侧 470 + 右侧 400 = 870，加高以容纳日期组） ---
+        WIN_W, WIN_H = 870, 850
         self.setMinimumSize(WIN_W, WIN_H)
         self.setMaximumSize(WIN_W, WIN_H)
         self.resize(WIN_W, WIN_H)
@@ -3229,31 +3177,39 @@ class MainWindow(QWidget, Ui_Form):
         mat_add_btn.clicked.connect(lambda: self.material_list.add_row())
 
         # ============================================================
-        # 7. 右侧面板：申请时间 / 受理时间（下）
+        # 7. 左栏：申请 / 受理 / 就诊 时间
         # ============================================================
-        DATE_H = 64
-        date_top = material_top + MATERIAL_H + 8
-        self.date_group = QGroupBox("申请 / 受理时间", self)
-        self.date_group.setGeometry(RIGHT_PANEL_X, date_top, RIGHT_PANEL_W, DATE_H)
+        DATE_H = 100
+        self.date_group = QGroupBox("申请 / 受理 / 就诊时间", self)
+        self.date_group.setGeometry(70, 655, 390, DATE_H)
         self.date_group.setFont(QFont("微软雅黑", 9))
 
         lbl_apply = QLabel("申请时间：", self.date_group)
-        lbl_apply.setGeometry(8, 28, 60, 20)
+        lbl_apply.setGeometry(8, 30, 60, 20)
 
         self.apply_time_edit = QLineEdit(self.date_group)
-        self.apply_time_edit.setGeometry(68, 26, 110, 22)
+        self.apply_time_edit.setGeometry(68, 28, 300, 22)
         self.apply_time_edit.setPlaceholderText("留空=当前")
         self.apply_time_edit.setToolTip("输入8位日期如20260816；留空则使用系统当前日期")
         self.apply_time_edit.editingFinished.connect(self._save_date_inputs)
 
         lbl_accept = QLabel("受理时间：", self.date_group)
-        lbl_accept.setGeometry(188, 28, 60, 20)
+        lbl_accept.setGeometry(8, 56, 60, 20)
 
         self.accept_time_edit = QLineEdit(self.date_group)
-        self.accept_time_edit.setGeometry(248, 26, 110, 22)
+        self.accept_time_edit.setGeometry(68, 54, 300, 22)
         self.accept_time_edit.setPlaceholderText("留空=当前")
         self.accept_time_edit.setToolTip("输入8位日期如20260816；留空则使用系统当前日期")
         self.accept_time_edit.editingFinished.connect(self._save_date_inputs)
+
+        lbl_visit = QLabel("就诊时间：", self.date_group)
+        lbl_visit.setGeometry(8, 82, 60, 20)
+
+        self.visit_time_edit = QLineEdit(self.date_group)
+        self.visit_time_edit.setGeometry(68, 80, 300, 22)
+        self.visit_time_edit.setPlaceholderText("留空=当前")
+        self.visit_time_edit.setToolTip("输入8位日期如20260816；留空则使用系统当前日期")
+        self.visit_time_edit.editingFinished.connect(self._save_date_inputs)
 
         print("✅ API配置UI已创建")
 
@@ -3268,11 +3224,13 @@ class MainWindow(QWidget, Ui_Form):
         return raw
 
     def _save_date_inputs(self):
-        """把申请时间/受理时间保存到数据模型（空值用系统当前时间）"""
+        """把申请时间/受理时间/就诊时间保存到数据模型（空值用系统当前时间）"""
         if not hasattr(self, 'apply_time_edit') or not hasattr(self, 'accept_time_edit'):
             return
         self.set_data('申请时间', self._resolve_date_input(self.apply_time_edit.text()), 'case')
         self.set_data('受理时间', self._resolve_date_input(self.accept_time_edit.text()), 'case')
+        if hasattr(self, 'visit_time_edit'):
+            self.set_data('就诊时间', self._resolve_date_input(self.visit_time_edit.text()), 'case')
 
     def _load_saved_user_config(self):
         """加载已保存的用户配置到UI"""
@@ -3877,16 +3835,16 @@ class MainWindow(QWidget, Ui_Form):
         """创建证人编号下拉框与「添加证人」按钮（代码创建，放在左栏底部空位）"""
         self.witness_label = QLabel("证人编号：", self)
         self.witness_label.setObjectName("witness_label")
-        self.witness_label.setGeometry(70, 650, 70, 20)
+        self.witness_label.setGeometry(70, 765, 70, 20)
 
         self.witness_combo = QComboBox(self)
         self.witness_combo.setObjectName("witness_combo")
-        self.witness_combo.setGeometry(140, 648, 180, 24)
+        self.witness_combo.setGeometry(140, 763, 180, 24)
         self.witness_combo.currentIndexChanged.connect(self._on_witness_selected)
 
         self.add_witness_btn = QPushButton("添加证人", self)
         self.add_witness_btn.setObjectName("add_witness_btn")
-        self.add_witness_btn.setGeometry(330, 648, 80, 24)
+        self.add_witness_btn.setGeometry(330, 763, 80, 24)
         self.add_witness_btn.clicked.connect(self._add_witness)
 
         self.witness_label.hide()
@@ -4427,15 +4385,6 @@ class MainWindow(QWidget, Ui_Form):
         self._set_status('信息提示', 'black', 'label_14')
         self._set_status('信息提示', 'black', 'label_12')
 
-    def _handle_injury_confirm(self, is_confirm: bool):
-        """「认定工伤」是/否 的处理入口（占位，待后续实现）
-
-        is_confirm: True=勾选（认为符合条例、可认定工伤）；
-                    False=未勾选（认为不可认定工伤）
-        """
-        # TODO: 待补充具体处理逻辑
-        pass
-
     def _extract_medical_conclusion(self, case_folder: str) -> str:
         """从本人笔录 docx 中提取医疗结论（受伤部位/诊断结论）"""
         try:
@@ -4513,6 +4462,35 @@ class MainWindow(QWidget, Ui_Form):
             print(f"⚠️ 读取本人笔录失败: {e}")
             return ""
 
+    def _read_all_transcripts(self, case_folder: str) -> str:
+        """读取案件目录下所有谈话笔录（本人/证人/法人）全文，按文件名分隔"""
+        try:
+            if not case_folder or not os.path.exists(case_folder):
+                return ""
+            exclude_kw = ("审批表", "告知书", "通知书", "发送给AI")
+            parts = []
+            for fname in sorted(os.listdir(case_folder)):
+                if not fname.endswith('.docx'):
+                    continue
+                if any(k in fname for k in exclude_kw):
+                    continue
+                fpath = os.path.join(case_folder, fname)
+                try:
+                    doc = Document(fpath)
+                    text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                    if text.strip():
+                        parts.append(f"=== {fname} ===\n{text}")
+                except Exception:
+                    continue
+            if not parts:
+                print("⚠️ 目录下没有可用的谈话笔录")
+                return ""
+            print(f"📚 读取全部笔录: {len(parts)} 份")
+            return "\n\n".join(parts)
+        except Exception as e:
+            print(f"⚠️ 读取全部笔录失败: {e}")
+            return ""
+
     def approve(self):
         """生成案件审批表 — 读取案本号 → JSON查数据 → 渲染模板"""
         try:
@@ -4544,74 +4522,111 @@ class MainWindow(QWidget, Ui_Form):
             person_name = case_data.get('person_name', '')
             company_name = case_data.get('company_name', '')
 
-            # ── 3. 「认定工伤」勾选 + 申请人名称（从JSON读取，旧数据回退推导）──
-            self._handle_injury_confirm(self.confirm_injury_checkbox.isChecked())
+            # ── 3. 申请人名称（从JSON读取，保存时已按申请类型算好）──
             applicant_name = case_data.get('applicant_name', '')
-            if not applicant_name:
-                # 兼容旧JSON：按申请类型推导
-                applicant_name = person_name if self.personal_application_checkbox.isChecked() else company_name
             self.set_data('申请人名称', applicant_name, 'case')
 
-            # ── 3.1 认定结论（予以认定/不予认定）──
-            is_confirm = self.confirm_injury_checkbox.isChecked()
-            conclusion = "予以认定" if is_confirm else "不予认定"
-            self.set_data('认定结论', conclusion, 'case')
-            self._update_case_field(case_number, conclusion=conclusion)
+            # ── 4. 确定案件文件夹（笔录都保存在 BASE_PATH/<案本号>/ 下）──
+            case_folder = os.path.join(self.BASE_PATH, case_number)
+            if not os.path.exists(case_folder):
+                # 兼容旧数据：JSON folder_name 或当前案件文件夹或兜底
+                folder_name = case_data.get('folder_name', '')
+                if folder_name:
+                    case_folder = os.path.join(self.BASE_PATH, folder_name)
+                elif self.current_case_folder and os.path.exists(self.current_case_folder):
+                    case_folder = self.current_case_folder
+                else:
+                    case_folder = str(path_utils.get_storage_path(
+                        f"{person_name}-工伤案件" if person_name else "未命名案件"
+                    ))
 
-            # 不予认定：先只发提醒（后续再调用案件审批预览函数）
-            if not is_confirm:
-                self._set_status('不予认定（待后续处理）', 'orange')
-                QMessageBox.information(self, "提示", "本案认定为「不予认定」，此部分流程待后续实现。")
-                return
-
-            # ── 4. 确定案件文件夹 ──
-            folder_name = case_data.get('folder_name', '')
-            case_folder = os.path.join(self.BASE_PATH, folder_name) if folder_name else self.current_case_folder
-            if not case_folder or not os.path.exists(case_folder):
-                case_folder = self.current_case_folder
-            if not case_folder or not os.path.exists(case_folder):
-                case_folder = str(path_utils.get_storage_path(
-                    f"{person_name}-工伤案件" if person_name else "未命名案件"
-                ))
-
-            # ── 4.1 医疗结论 / 受伤经过（有AI用AI判断，无AI用笔录提取）──
+            # ── 4.1 医疗结论 / 受伤经过（AI 分析全部笔录 → 认定/不予认定决策）──
             medical_conclusion = ''
             injury_process = ''
-            if self.ai_service:
-                # 有AI：读本人笔录一次，同时生成「调查核实情况」段落 + 诊断结论
-                transcript_text = self._read_person_transcript_from_folder(case_folder)
-                if transcript_text:
-                    # 解析适用条款情形，供 AI 突出关键证据要素
-                    from case_classifier import CaseClassifier
-                    regulation = case_data.get('regulation', '')
-                    reg_desc = ""
-                    reg_elements = []
-                    for _idx, _reg in CaseClassifier.REGULATIONS.items():
-                        if _reg.get("text") == regulation:
-                            reg_desc = _reg.get("desc", "")
-                            reg_elements = _reg.get("elements", [])
-                            break
-                    result = self.ai_service.generate_injury_and_conclusion(
-                        transcript_text,
-                        regulation_text=regulation,
-                        regulation_desc=reg_desc,
-                        regulation_elements=reg_elements,
-                    )
-                    if result:
-                        injury_process = result.get("受伤经过", "") or ""
-                        medical_conclusion = result.get("诊断结论", "") or ""
-                if injury_process:
-                    self.set_data('本人受伤经过', injury_process, 'investigation')
-                    self._update_case_field(case_number, injury_process=injury_process)
-            else:
-                # 无AI：从本人笔录提取医疗结论，受伤经过留空
-                medical_conclusion = self._extract_medical_conclusion(case_folder)
+            conclusion = "予以认定"
 
-            # 诊断结论兜底：AI 未给出或为"无"时，用规则从本人笔录提取
-            if not medical_conclusion or medical_conclusion.strip() in ("无", "待核实", "【待核实】"):
-                fallback_conclusion = self._extract_medical_conclusion(case_folder)
-                if fallback_conclusion:
-                    medical_conclusion = fallback_conclusion
+            if not self.ai_service:
+                # 无 AI：提醒并停止（不生成审批表）
+                QMessageBox.warning(self, "提示", "未配置AI，无法分析认定/不予认定，不能生成案件审批表。")
+                return
+
+            # 解析适用条款情形，供 AI 突出关键证据要素
+            from case_classifier import CaseClassifier
+            regulation = case_data.get('regulation', '')
+            reg_desc = ""
+            reg_elements = []
+            for _idx, _reg in CaseClassifier.REGULATIONS.items():
+                if _reg.get("text") == regulation:
+                    reg_desc = _reg.get("desc", "")
+                    reg_elements = _reg.get("elements", [])
+                    break
+
+            # 读取该案全部谈话笔录（本人/证人/法人）
+            all_text = self._read_all_transcripts(case_folder)
+            if not all_text:
+                QMessageBox.warning(self, "提示", "该案件目录下没有找到谈话笔录，无法分析。\n请先生成本人/证人/法人谈话笔录。")
+                return
+
+            # AI 分析 → 认定/不予认定 偏向
+            self._set_status('正在AI分析笔录...', 'black')
+            QApplication.processEvents()
+            analysis = self.ai_service.analyze_approval_transcripts(
+                all_text,
+                case_id=case_number,
+                regulation_text=regulation,
+                regulation_desc=reg_desc,
+                regulation_elements=reg_elements,
+            )
+            if not analysis:
+                QMessageBox.warning(self, "提示", "AI 分析失败，请重试。")
+                return
+
+            # 展示对话框（认定工伤 / 不予认定工伤 / 保存）
+            dlg = ApprovalDecisionDialog(analysis, self)
+            dlg.exec_()
+            choice = dlg.get_choice()
+
+            if choice == "保存":
+                # 保存分析结果到 JSON，不生成审批表
+                self._update_case_field(case_number,
+                                        analysis_result=analysis.get("分析", ""),
+                                        conclusion_bias=analysis.get("偏向", ""))
+                self._set_status('已保存 AI 分析结果', 'green')
+                return
+
+            # 生成「调查核实情况」段落（受伤经过）
+            self._set_status('正在AI生成调查核实情况...', 'black')
+            QApplication.processEvents()
+            gen_result = self.ai_service.generate_injury_and_conclusion(
+                all_text,
+                regulation_text=regulation,
+                regulation_desc=reg_desc,
+                regulation_elements=reg_elements,
+            )
+            if gen_result:
+                injury_process = gen_result.get("受伤经过", "") or ""
+                medical_conclusion = gen_result.get("诊断结论", "") or ""
+            if not injury_process:
+                QMessageBox.warning(self, "提示", "生成调查核实情况失败，请重试。")
+                return
+
+            if choice == "不予认定":
+                # 不予认定：在调查核实后面追加关键理由
+                reasons = analysis.get("关键理由", []) or []
+                if reasons:
+                    injury_process += "\n不予认定的关键理由：\n" + "\n".join(
+                        f"{i + 1}. {r}" for i, r in enumerate(reasons))
+                conclusion = "不予认定"
+            else:
+                conclusion = "予以认定"
+
+            # 回写 JSON：受伤经过 / 诊断结论 / 结论
+            self.set_data('本人受伤经过', injury_process, 'investigation')
+            self.set_data('认定结论', conclusion, 'case')
+            self._update_case_field(case_number,
+                                    injury_process=injury_process,
+                                    medical_conclusion=medical_conclusion,
+                                    conclusion=conclusion)
 
             # 医疗结论写入数据模型
             if medical_conclusion:
@@ -4642,7 +4657,7 @@ class MainWindow(QWidget, Ui_Form):
                     f"找不到模板文件:\n{template_path}")
                 return
 
-            # ── 5. 预处理模板：勾选「认定工伤」方框（予以认定）──
+            # ── 5. 预处理模板：根据结论在「认定工伤/不予认定工伤」方框打勾 ──
             import tempfile
             import shutil
             temp_template = os.path.join(tempfile.gettempdir(), '_temp_approval_table.docx')
@@ -4650,17 +4665,22 @@ class MainWindow(QWidget, Ui_Form):
 
             from docx import Document as DocxEditor
             doc_edit = DocxEditor(temp_template)
+            check_confirm = (conclusion == "予以认定")
             for table in doc_edit.tables:
                 for row in table.rows:
                     for cell in row.cells:
                         for p in cell.paragraphs:
-                            if "□认定工伤" in p.text:
+                            if check_confirm and "□认定工伤" in p.text:
                                 full = p.text.replace("□认定工伤", "☑认定工伤", 1)
-                                if p.runs:
-                                    p.runs[0].text = full
-                                    for r in p.runs[1:]:
-                                        r.text = ""
-                                break
+                            elif (not check_confirm) and "□不予认定工伤" in p.text:
+                                full = p.text.replace("□不予认定工伤", "☑不予认定工伤", 1)
+                            else:
+                                continue
+                            if p.runs:
+                                p.runs[0].text = full
+                                for r in p.runs[1:]:
+                                    r.text = ""
+                            break
             doc_edit.save(temp_template)
 
             # ── 6. 渲染模板（仅替换带 {{}} 外框的占位符）──
