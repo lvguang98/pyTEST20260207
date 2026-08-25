@@ -1,27 +1,25 @@
 import os
-import sys
 import json
 import datetime
 import logging
-from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 from ctypes import windll, byref, create_string_buffer, c_int32, c_uint
 import pandas as pd
 from docx import Document
 from docxtpl import DocxTemplate
 from PyQt5.Qt import *
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QMessageBox, QDialog, QVBoxLayout,
     QLabel, QTextEdit, QPushButton, QHBoxLayout, QInputDialog,
     QLineEdit, QComboBox, QCompleter, QCheckBox, QProgressDialog,
-    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup,
+    QTableWidget, QTableWidgetItem,
     QGroupBox
 )
 from PyQt5.QtGui import QFont
 
 from ui_main_window import Ui_Form
-from services import FileService, DataService, TemplateService, TemplateVariableManager
+from services import FileService, DataService, TemplateVariableManager
 from ai_service import AIService
 from config_service import ConfigService
 from path_utils import path_utils
@@ -1166,7 +1164,6 @@ class MainWindow(QWidget, Ui_Form):
         # 第四步：初始化其他核心服务（使用正确的路径）
         self.file_service = FileService(self.BASE_PATH)
         self.data_service = DataService()
-        self.template_service = TemplateService(self.TEMPLATE_PATH)
 
         # 第五步：更新所有服务的路径
         self._update_services_paths()
@@ -2425,12 +2422,6 @@ class MainWindow(QWidget, Ui_Form):
             self.file_service.BASE_PATH = self.BASE_PATH
             print(f"✅ 更新FileService路径: {self.BASE_PATH}")
 
-        # 更新TemplateService（使用 path_utils 的路径）
-        if hasattr(self, 'template_service'):
-            self.template_service.template_path = self.TEMPLATE_PATH
-            self.template_service.template_base_path = self.TALK_TEMPLATE_PATH  # 使用已获取的路径
-            self.template_service.document_template_path = self.DOCUMENT_TEMPLATE_PATH  # 使用已获取的路径
-            print(f"✅ 更新TemplateService路径: {self.TEMPLATE_PATH}")
 
         # 更新数据模型
         if hasattr(self, 'data_model'):
@@ -2940,25 +2931,6 @@ class MainWindow(QWidget, Ui_Form):
                         resource.close()
                 except Exception as e:
                     print(f"清理资源 {attr_name} 失败: {e}")
-
-    def _clean_ai_output(self, text):
-        """清理AI输出中的重复标点（保留正常句号）"""
-        import re
-
-        if not text:
-            return text
-
-        # 1. 替换连续的句号（2个或更多）为单个句号
-        text = re.sub(r'。{2,}', '。', text)
-
-        # 2. 替换连续的中文逗号为单个逗号
-        text = re.sub(r'，{2,}', '，', text)
-
-        # 3. 清理"句号+空格+句号"的情况
-        text = re.sub(r'。\s*。', '。', text)
-
-        return text
-
     def _set_status(self, text, color="black", label="label_14"):
         """设置状态标签"""
         label_widget = getattr(self, label, None)
@@ -3656,126 +3628,111 @@ class MainWindow(QWidget, Ui_Form):
             QMessageBox.critical(self, "保存失败", f"保存失败：{str(e)}")
 
     def generate_injury_notice(self):
-        """生成工伤告知书"""
+        """生成工伤告知书：按案本号找目录 → 检查审批表 → 按JSON结论选模板渲染"""
         try:
-            print("🔄 开始生成工伤告知书...")
-
-            # 1. 获取本人姓名
-            person_name = self.get_data("本人姓名", "")
-            if not person_name:
-                person_name = self.name_pane.text().strip()
-            if not person_name:
-                self._set_status('请先输入本人姓名', 'red')
-                QMessageBox.warning(self, "提示", "请先输入受伤职工姓名")
+            # 1. 读案本号
+            case_number = self.lineEdit_2.text().strip()
+            if not case_number:
+                self._set_status('未找到案本号', 'red')
+                QMessageBox.warning(self, "提示", "请先输入或生成案本号")
                 return
 
-            # 2. 检查案件文件夹
-            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                self._set_status('请先保存案件信息', 'red')
-                QMessageBox.warning(self, "提示", "请先保存案件信息")
+            # 2. 用案本号找案件文件夹
+            case_folder = os.path.join(self.BASE_PATH, case_number)
+            if not os.path.exists(case_folder):
+                self._set_status('未找到案件目录', 'red')
+                QMessageBox.warning(self, "提示", f"未找到案本号对应的案件目录：\n{case_folder}")
                 return
 
-            # 3. 查找本人案件审批表
-            approval_file_name = f"{person_name}案件审批表.docx"
-            approval_file_path = os.path.join(self.current_case_folder, approval_file_name)
+            # 3. 检查审批表文件
+            approval_files = [f for f in os.listdir(case_folder)
+                              if f.endswith('.docx') and '审批表' in f]
+            if not approval_files:
+                self._set_status('目录下没有审批表文件，请先生成案件审批表', 'red')
+                QMessageBox.warning(self, "提示", "目录下没有审批表文件，请先生成案件审批表。")
+                return
 
-            if not os.path.exists(approval_file_path):
-                # 尝试查找其他可能的审批表文件
-                all_files = os.listdir(self.current_case_folder)
-                approval_files = [f for f in all_files if "审批表" in f and f.endswith('.docx')]
-
-                if not approval_files:
-                    self._set_status('请先生成案件审批表', 'red')
-                    QMessageBox.warning(self, "提示", "请先生成案件审批表")
+            # 多个审批表：弹窗选择
+            selected_file = approval_files[0]
+            if len(approval_files) > 1:
+                choice, ok = QInputDialog.getItem(self, "选择审批表",
+                                                  "目录下有多个审批表，请选择：",
+                                                  approval_files, 0, False)
+                if not ok or not choice:
+                    self._set_status('已取消', 'black')
                     return
+                selected_file = choice
+            print(f"✅ 使用审批表: {selected_file}")
 
-                approval_file_path = os.path.join(self.current_case_folder, approval_files[0])
-                print(f"⚠️ 使用替代审批表: {approval_files[0]}")
+            # 4. 用 JSON 数据生成字典
+            case_obj = self._load_cases_data().get(case_number)
+            if not case_obj:
+                self._set_status('未找到该案本号的案件数据', 'red')
+                QMessageBox.warning(self, "提示", f"未在数据中找到案本号：{case_number}")
+                return
+            template_data = self._build_notice_template_data(case_obj)
 
-            print(f"✅ 找到审批表文件: {approval_file_path}")
-
-            # 4. 从审批表提取数据（复用现有方法）
-            self._set_status('正在提取审批表数据...', 'black')
-            QApplication.processEvents()
-
-            extracted_data = self.extract_data_from_approval_table(approval_file_path)
-
-            if not extracted_data:
-                self._set_status('提取审批表数据失败', 'red')
+            # 5. 按 JSON 结论选模板
+            conclusion = case_obj.get('conclusion', '')
+            if conclusion == "不予认定":
+                template_name = '不予工伤认定告知书（样本）.docx'
+            else:
+                template_name = '工伤认定告知书（样本）.docx'
+            template_path = str(path_utils.get_document_template_path(template_name))
+            if not os.path.exists(template_path):
+                self._set_status(f'模板文件不存在: {template_name}', 'red')
+                QMessageBox.critical(self, "错误", f"找不到模板文件:\n{template_path}")
                 return
 
-            # 5. 准备模板数据
-            current_date = _date_now()
-            current_time = _time_now()
-
-            # 获取公司信息
-            company_name = extracted_data.get('用人单位', self.company_pane.currentText().strip())
-            if not company_name:
-                company_name = self.get_data('用人单位', '未知公司')
-
-            # 获取身份证号
-            id_number = extracted_data.get('职工身份证号', self.get_data('本人身份证号', ''))
-
-            # 获取申请时间（如果有的话）
-            application_date = extracted_data.get('申请时间', current_date)
-
-            # 准备模板数据
-            template_data = {
-                '用人单位': company_name,
-                '本人姓名': extracted_data.get('职工姓名', person_name),
-                '职工性别': extracted_data.get('职工性别', self.get_data('本人性别', '')),
-                '本人身份证号': id_number,
-                '受伤经过': extracted_data.get('受伤经过', '详见谈话笔录'),
-                '当前时期': current_date,
-                '当前日期': current_date,
-                '当前时间': current_time,
-                '申请时间': application_date,
-                '案本号': self.get_data('案本号', ''),
-                '告知日期': current_date,
-                '受理编号': self.lineEdit_2.text().strip() or self.get_data('案本号', '')
-            }
-
-            # 6. 检查模板文件
-            template_path = str(path_utils.get_document_template_path('工伤告知书（样本）.docx'))
-
-            # 7. 生成文档
+            # 6. 渲染
             self._set_status('正在生成工伤告知书...', 'black')
             QApplication.processEvents()
+            from docxtpl import DocxTemplate
+            word = DocxTemplate(template_path)
+            word.render(template_data)
 
-            try:
-                from docxtpl import DocxTemplate
-                word = DocxTemplate(template_path)
-                word.render(template_data)
+            # 7. 保存 + 打开
+            name = case_obj.get('name', '') or '职工'
+            if conclusion == "不予认定":
+                notice_file_name = f"{name}不予工伤认定告知书.docx"
+            else:
+                notice_file_name = f"{name}工伤认定告知书.docx"
+            target_path = os.path.join(case_folder, notice_file_name)
+            word.save(target_path)
+            print(f"✅ 工伤告知书保存到: {target_path}")
 
-                notice_file_name = f"{person_name}工伤告知书.docx"
-                target_path = os.path.join(self.current_case_folder, notice_file_name)
-                word.save(target_path)
-
-                print(f"✅ 工伤告知书保存到: {target_path}")
-
-                # 打开文件
-                success, message = self.file_service.open_document(target_path)
-                if success:
-                    self._set_status('工伤告知书生成成功', 'green')
-                    QMessageBox.information(self, "成功", f"工伤告知书已生成:\n{notice_file_name}")
-                else:
-                    self._set_status(f'工伤告知书生成成功，但打开失败: {message}', 'orange')
-                    QMessageBox.information(self, "成功",
-                                            f"工伤告知书已生成:\n{notice_file_name}\n\n但打开失败: {message}")
-
-            except Exception as e:
-                print(f"❌ 生成工伤告知书失败: {e}")
-                import traceback
-                traceback.print_exc()
-                self._set_status(f'生成工伤告知书失败: {str(e)}', 'red')
-                QMessageBox.critical(self, "错误", f"生成工伤告知书失败:\n{str(e)}")
+            success, message = self.file_service.open_document(target_path)
+            if success:
+                self._set_status('工伤告知书生成成功', 'green')
+                QMessageBox.information(self, "成功", f"工伤告知书已生成:\n{notice_file_name}")
+            else:
+                self._set_status(f'工伤告知书生成成功，但打开失败: {message}', 'orange')
+                QMessageBox.information(self, "成功",
+                                        f"工伤告知书已生成:\n{notice_file_name}\n\n但打开失败: {message}")
 
         except Exception as e:
-            print(f"❌ 工伤告知书过程异常: {e}")
+            print(f"❌ 生成工伤告知书失败: {e}")
             import traceback
             traceback.print_exc()
-            self._set_status(f'生成工伤告知书异常: {str(e)}', 'red')
-            QMessageBox.critical(self, "错误", f"生成工伤告知书异常:\n{str(e)}")
+            self._set_status(f'生成工伤告知书失败: {str(e)}', 'red')
+            QMessageBox.critical(self, "错误", f"生成工伤告知书失败:\n{str(e)}")
+
+    def _build_notice_template_data(self, case_obj: dict) -> dict:
+        """构建工伤告知书模板字典（从案件 JSON 数据）"""
+        current_date = _date_now()
+        return {
+            '本人姓名': case_obj.get('name', ''),
+            '本人身份证号': case_obj.get('id_card', ''),
+            '用人单位': case_obj.get('labor_unit', ''),  # 用人单位（签合同单位）
+            '受伤经过': case_obj.get('injury_process', case_obj.get('injury_description', '详见谈话笔录')),
+            '医疗证明': case_obj.get('medical_conclusion', ''),
+            '申请时间': case_obj.get('apply_time', current_date),
+            '受理时间': case_obj.get('accept_time', current_date),
+            '当前时期': current_date + _time_now(),
+            '告知日期': current_date,
+            '受理编号': case_obj.get('case_id', ''),
+            '案本号': case_obj.get('case_id', ''),
+        }
 
     def _apply_ui_settings(self):
         """应用UI设置"""
@@ -4028,16 +3985,6 @@ class MainWindow(QWidget, Ui_Form):
         """简化日志系统"""
         self.log_warning = lambda msg: print(f"警告: {msg}")
         self.log_error = lambda msg: print(f"错误: {msg}")
-
-    def show_validation_errors(self, errors: List[str]) -> bool:
-        """显示验证错误"""
-        if errors:
-            error_msg = "数据验证失败：\n" + "\n".join(errors)
-            display_msg = error_msg[:100] + "..." if len(error_msg) > 100 else error_msg
-            self._set_status(display_msg, 'red')
-            return False
-        return True
-
     def on_case_type_changed(self):
         """当案件类型选择改变时调用"""
         is_death_case = self.death_case_checkbox.isChecked()
@@ -4384,84 +4331,6 @@ class MainWindow(QWidget, Ui_Form):
 
         self._set_status('信息提示', 'black', 'label_14')
         self._set_status('信息提示', 'black', 'label_12')
-
-    def _extract_medical_conclusion(self, case_folder: str) -> str:
-        """从本人笔录 docx 中提取医疗结论（受伤部位/诊断结论）"""
-        try:
-            if not case_folder or not os.path.exists(case_folder):
-                return ""
-            # 找本人笔录文件
-            person_files = [f for f in os.listdir(case_folder)
-                            if "本人" in f and f.endswith('.docx') and "审批表" not in f]
-            if not person_files:
-                print("⚠️ 未找到本人笔录文件，无法提取医疗结论")
-                return ""
-
-            file_path = os.path.join(case_folder, person_files[0])
-            document = Document(file_path)
-            injury_location = ""
-
-            for i, paragraph in enumerate(document.paragraphs):
-                text = paragraph.text
-                if ("医疗结论" in text or "诊断结论" in text or "医院诊断" in text) \
-                        and i + 1 < len(document.paragraphs):
-                    next_para = document.paragraphs[i + 1].text.strip()
-                    if next_para.startswith("答："):
-                        injury_location = next_para[2:].strip()
-                        break
-
-            if not injury_location:
-                print("⚠️ 笔录中未找到医疗结论")
-                return ""
-
-            # 去掉常见开头
-            for prefix in ["医院对我的结论是：", "医院结论是：", "医院诊断是：",
-                           "诊断结论是：", "医疗结论是：", "结论是：", "诊断为："]:
-                if injury_location.startswith(prefix):
-                    injury_location = injury_location[len(prefix):]
-                    break
-
-            # 去掉冒号前缀
-            if "：" in injury_location:
-                parts = injury_location.split("：", 1)
-                if len(parts) > 1 and parts[1].strip():
-                    injury_location = parts[1]
-
-            # 清理结尾标点
-            injury_location = injury_location.rstrip('。.').rstrip('，,').strip()
-
-            # 写入数据模型
-            self.data_model.investigation['医院诊断'] = injury_location
-            self.data_model.investigation['医疗结论'] = injury_location
-
-            print(f"✅ 提取的医疗结论/受伤部位: {injury_location}")
-            return injury_location
-
-        except Exception as e:
-            print(f"⚠️ 提取医疗结论失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return ""
-
-    def _read_person_transcript_from_folder(self, case_folder: str) -> str:
-        """读取案件文件夹下本人笔录全文"""
-        try:
-            if not case_folder or not os.path.exists(case_folder):
-                return ""
-            person_files = [f for f in os.listdir(case_folder)
-                            if "本人" in f and f.endswith('.docx') and "审批表" not in f]
-            if not person_files:
-                print("⚠️ 未找到本人笔录文件")
-                return ""
-            file_path = os.path.join(case_folder, person_files[0])
-            document = Document(file_path)
-            text = "\n".join(p.text for p in document.paragraphs if p.text.strip())
-            print(f"📄 读取本人笔录: {os.path.basename(file_path)} ({len(text)}字符)")
-            return text
-        except Exception as e:
-            print(f"⚠️ 读取本人笔录失败: {e}")
-            return ""
-
     def _read_all_transcripts(self, case_folder: str) -> str:
         """读取案件目录下所有谈话笔录（本人/证人/法人）全文，按文件名分隔"""
         try:
@@ -4539,6 +4408,29 @@ class MainWindow(QWidget, Ui_Form):
                     case_folder = str(path_utils.get_storage_path(
                         f"{person_name}-工伤案件" if person_name else "未命名案件"
                     ))
+
+            # ── 4.0 检查目录下是否已有审批表文件 ──
+            existing_approval = None
+            if os.path.isdir(case_folder):
+                for fname in sorted(os.listdir(case_folder)):
+                    if fname.endswith('.docx') and '审批表' in fname:
+                        existing_approval = os.path.join(case_folder, fname)
+                        break
+            if existing_approval:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("审批表已存在")
+                msg.setText("该案件目录下已有审批表文件，如何处理？")
+                view_btn = msg.addButton("查看已有审批表", QMessageBox.AcceptRole)
+                new_btn = msg.addButton("新建一个审批表", QMessageBox.ActionRole)
+                msg.exec_()
+                if msg.clickedButton() == view_btn:
+                    success, _ = self.file_service.open_document(existing_approval)
+                    if success:
+                        self._set_status('已打开已有审批表', 'green')
+                    else:
+                        self._set_status('打开已有审批表失败', 'orange')
+                    return
+                # 选择新建：继续走新建流程（文件名会自动加一）
 
             # ── 4.1 医疗结论 / 受伤经过（AI 分析全部笔录 → 认定/不予认定决策）──
             medical_conclusion = ''
@@ -4746,308 +4638,6 @@ class MainWindow(QWidget, Ui_Form):
         date = datetime.datetime.now().strftime("%Y%m%d")
         id_last4 = id_card[-4:] if id_card and len(id_card) >= 4 else "xxxx"
         return f"{person_name}-{prefix}{date}{id_last4}"
-
-    def work_save(self):
-        """保存当前案件信息"""
-        try:
-            current_role = self.get_current_role_type()
-
-            # 如果是证人/法人，自动查找同一案件的文件夹
-            if current_role in ["证人", "法人"]:
-                person_name = self.get_data('本人姓名', '') or self.name_pane.text().strip()
-
-                if not person_name:
-                    self._set_status('请先输入受伤职工姓名', 'red')
-                    return
-
-                # 自动查找已有案件文件夹
-                if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                    matched = self.file_service.search_cases_by_person_name(
-                        self.BASE_PATH, person_name
-                    )
-                    if matched:
-                        self.current_case_folder = matched[0]['folder_path']
-                        self.current_person_name = person_name
-                        self._load_witnesses()
-                        print(f"📁 自动关联到案件文件夹: {self.current_case_folder}")
-                    else:
-                        self._set_status('未找到案件文件夹，请先生成本人笔录', 'red')
-                        return
-
-            # 使用 lineEdit_2 中显示的案本号
-            case_number = self.lineEdit_2.text().strip()
-            if not case_number:
-                person_name = self.get_data('本人姓名', '') or self.name_pane.text().strip()
-                id_card = self.idnumer_pane.text().strip() or self.get_data('本人身份证号', '')
-                case_number = self._auto_generate_case_number(person_name, id_card)
-                self.lineEdit_2.setText(case_number)
-            self.set_data('案本号', case_number, 'case')
-
-            is_valid, errors = self.validate_current_data()
-            if not self.show_validation_errors(errors):
-                return
-
-            # 获取人员信息
-            role_type = self.get_current_role_type()
-
-            # 获取本人姓名
-            person_name = self.get_data('本人姓名', '')
-            if not person_name:
-                person_name = self.name_pane.text().strip()
-                if person_name:
-                    self.set_data('本人姓名', person_name, 'basic')
-            if not person_name:
-                self._set_status('请输入本人姓名', 'red')
-                return
-
-            # 获取角色姓名
-            role_name_key = f"{role_type}姓名"
-            role_name = self.get_data(role_name_key, '')
-            if not role_name:
-                role_name = self.name_pane.text().strip()
-                if role_name:
-                    self.set_data(role_name_key, role_name, 'basic')
-                else:
-                    self._set_status(f'请输入{role_type}姓名', 'red')
-                    return
-
-            # 获取公司信息
-            company_info = self.get_company_info()
-            company_name = company_info['用工单位']
-            employer = company_info['用人单位']
-            site = company_info['工地名称']
-
-            # 更新公司数据
-            if company_name:
-                self.set_data('用工单位', company_name, 'company')
-            if employer:
-                self.set_data('用人单位', employer, 'company')
-            if site:
-                self.set_data('工地名称', site, 'company')
-
-            number = self.comboBox.currentIndex()
-            has_employer = bool(employer)
-            has_site = bool(site)
-
-            # 获取案件配置
-            is_death_case = self.death_case_checkbox.isChecked()
-            is_personal = self.personal_application_checkbox.isChecked()
-
-            # 使用TemplateService获取模板路径
-            self.open_file_path = self.template_service.get_template_path(
-                role=role_type,
-                case_type=number,
-                is_death_case=is_death_case,
-                is_personal=is_personal
-            )
-
-            # 检查模板文件是否存在
-            if not os.path.exists(self.open_file_path):
-                print(f"⚠️ 模板文件不存在: {self.open_file_path}")
-
-                # 尝试查找模板文件
-                found_template = self._find_template_file(role_type, number, is_death_case, is_personal)
-                if found_template:
-                    self.open_file_path = found_template
-                    print(f"✅ 找到替代模板: {self.open_file_path}")
-                else:
-                    self._set_status('模板文件不存在，请检查模板配置', 'red')
-                    return
-
-            # 收集所有变量
-            all_variables = self.var_manager.collect_variables(
-                role_type, number, has_employer, has_site
-            )
-            all_variables['案本号'] = case_number
-            all_variables = self._ensure_required_fields(all_variables, role_type)
-
-            # 添加自我介绍
-            if role_type == "法人":
-                position = self.get_data('法人职务', '')
-            else:
-                position = self.get_data(f'{role_type}岗位', '')
-            id_address = self.get_data(f'{role_type}身份证地址', '')
-
-            # 自我介绍：company 传用人单位（=局部变量 employer），employer 传用工单位（=局部变量 company_name）
-            self_intro = self.var_manager.get_self_introduction(
-                role_type, employer, company_name, site, role_name, position, id_address
-            )
-            all_variables['自我介绍内容'] = self_intro
-
-            # 更新字典
-            self._template_dict.clear()
-            self._template_dict.update(all_variables)
-
-            # 创建或获取案件文件夹
-            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                self.current_person_name = person_name
-
-                case_info = {
-                    'case_number': case_number,
-                    'person_name': person_name.strip(),
-                    'id_card': self.get_data('本人身份证号', '')
-                }
-
-                # 调用新的文件夹创建方法
-                self.current_case_folder = self.file_service.create_enhanced_case_folder(
-                    self.BASE_PATH,  # 基础存储路径
-                    case_info  # 案件信息
-                )
-
-                print(f"📁 创建案件文件夹: {os.path.basename(self.current_case_folder)}")
-
-            # 生成文件名（证人带自动序号：证人一/证人二/…）
-            witness_label = ""
-            if role_type == "证人":
-                self._ensure_current_witness()
-                self._sync_form_to_current_witness()
-                w = self._current_witness()
-                if w:
-                    witness_label = w.get("序号", "")
-
-            base_name = os.path.basename(self.open_file_path).replace('.docx', '')
-            if role_type == "证人" and witness_label:
-                file_name = f"{base_name}（{witness_label}）{role_name}.docx"
-            else:
-                file_name = f"{base_name}（{role_type}）{role_name}.docx"
-            target_path = os.path.join(self.current_case_folder, file_name)
-
-            try:
-                # 处理模板
-                temp_template_path = self.template_service.process_template(
-                    template_path=self.open_file_path,
-                    role_type=role_type,
-                    case_type=number,
-                    variables=all_variables,
-                    need_special_questions=self.need_special_questions()
-                )
-
-                if not temp_template_path or not os.path.exists(temp_template_path):
-                    self._set_status('模板处理失败', 'red')
-                    return
-
-                # 渲染并保存文档
-                from docxtpl import DocxTemplate
-                doc = DocxTemplate(temp_template_path)
-                doc.render(all_variables)
-                doc.save(target_path)
-
-                # 如果有 AI 生成的问答内容，插入到文档中
-                if hasattr(self, '_ai_transcript_content') and self._ai_transcript_content:
-                    self._insert_ai_content_into_doc(target_path)
-                    self._ai_transcript_content = ""  # 用完即清
-
-                self._set_status(f'文件保存成功，案本号: {case_number}', 'green')
-
-                self._update_case_in_data(
-                    case_number=case_number,
-                    person_name=person_name,
-                    folder_path=self.current_case_folder,
-                    transcript_file=file_name
-                )
-
-                # 持久化证人数据（证人角色时）
-                self._save_witnesses()
-
-                # 打开文件
-                success, message = self.file_service.open_document(target_path)
-                if not success:
-                    self._set_status(f'文件保存成功，但打开失败: {message}', 'orange')
-
-                # 清理临时文件
-                self._cleanup_temp_file(temp_template_path)
-
-            except Exception as e:
-                self._set_status(f'文件保存失败: {str(e)}', 'red')
-                import traceback
-                traceback.print_exc()
-
-        except Exception as e:
-            self._set_status(f'保存过程异常: {str(e)}', 'red')
-            import traceback
-            traceback.print_exc()
-
-    def _update_case_in_data(self, case_number, person_name, folder_path, transcript_file):
-        """把保存笔录时产生的字段（文件夹名、笔录文件名等）写回 cases_data.json 的当前案件"""
-        try:
-            import datetime
-
-            print(f"📝 正在更新案件数据: {case_number}")
-
-            cases = self._load_cases_data()
-            case_obj = cases.get(case_number)
-            if case_obj is None:
-                print("⚠️ 案件数据中未找到该案本号，跳过更新")
-                return
-
-            case_obj['folder_name'] = os.path.basename(folder_path)
-            case_obj['transcript_file'] = transcript_file
-            case_obj['case_type'] = "工亡" if self.death_case_checkbox.isChecked() else "工伤"
-            case_obj['updated_time'] = datetime.datetime.now().isoformat()
-            case_obj.setdefault('created_date', datetime.datetime.now().strftime("%Y-%m-%d"))
-            self._save_cases_data(cases)
-
-            print(f"✅ 案件数据已更新: {case_number}")
-            # 保存当前案本号，供后续使用
-            self.current_case_number = case_number
-            # 更新数据模型
-            self.set_data('案本号', case_number, 'case')
-
-        except Exception as e:
-            print(f"❌ 更新案件数据失败（非致命错误）: {e}")
-            # 这里不抛出异常，避免影响主流程
-
-    def _find_template_file(self, role_type, case_type, is_death_case, is_personal):
-        """查找模板文件"""
-        # 可能的模板名称
-        template_names = []
-
-        if is_death_case:
-            if is_personal:
-                template_names.append(f"{role_type}谈话笔录（个人申请工亡案件）.docx")
-            template_names.append(f"{role_type}谈话笔录（工亡案件）.docx")
-        else:
-            case_templates = {
-                0: f"{role_type}谈话笔录（普通案件）.docx",
-                1: f"{role_type}谈话笔录（工作前后案件）.docx",
-                2: f"{role_type}谈话笔录（暴力伤害案件）.docx",
-                3: f"{role_type}谈话笔录（患职业病案件）.docx",
-                4: f"{role_type}谈话笔录（因工外出案件）.docx",
-                5: f"{role_type}谈话笔录（上下班时案件）.docx"
-            }
-            template_names.append(case_templates.get(case_type, f"{role_type}谈话笔录（普通案件）.docx"))
-
-        # 添加默认名称
-        template_names.append(f"{role_type}谈话笔录（普通案件）.docx")
-        template_names.append(f"{role_type}谈话笔录.docx")
-        template_names.append("谈话笔录.docx")
-
-        # 在多个位置查找
-        search_paths = [
-            self.TEMPLATE_PATH,
-            os.path.join(self.TEMPLATE_PATH, "谈话模板"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource", "模板文件", "谈话模板"),
-        ]
-
-        for search_path in search_paths:
-            if os.path.exists(search_path):
-                for template_name in template_names:
-                    template_path = os.path.join(search_path, template_name)
-                    if os.path.exists(template_path):
-                        return template_path
-
-        return None
-
-    def _cleanup_temp_file(self, temp_template_path):
-        """清理临时模板文件"""
-        try:
-            if (temp_template_path and
-                    os.path.exists(temp_template_path) and
-                    temp_template_path != self.open_file_path):
-                os.remove(temp_template_path)
-        except Exception as e:
-            print(f"⚠️ 清理临时文件失败: {e}")
-
     def get_company_info(self) -> Dict[str, str]:
         """获取公司相关信息（company_pane=用人单位，construction_company=用工单位）"""
         employer = self.construction_company.currentText().strip()
@@ -5066,71 +4656,6 @@ class MainWindow(QWidget, Ui_Form):
             '用人单位': labor_unit,
             '工地名称': site
         }
-
-    def validate_current_data(self) -> Tuple[bool, List[str]]:
-        """验证当前数据（使用DataService）"""
-        # 收集当前数据
-        current_data = {}
-
-        role = self.get_current_role_type()
-
-        # 人员数据
-        if role in ["本人", "证人", "法人"]:
-            current_data.update({
-                '姓名': self.get_data(f"{role}姓名", ''),
-                '身份证号': self.get_data(f"{role}身份证号", ''),
-                '年龄': self.get_data(f"{role}年龄", '')
-            })
-
-        # 公司数据
-        current_data['用工单位'] = self.get_data('用工单位', '')
-
-        # 案件数据
-        current_data['案本号'] = self.get_data('案本号', '')
-
-        # 使用DataService验证
-        errors = self.data_service.validate_case_data(current_data)
-
-        return len(errors) == 0, errors
-
-    def _ensure_required_fields(self, variables: Dict[str, Any], role: str) -> Dict[str, Any]:
-        """确保模板所需的所有字段都存在"""
-        required_fields = [
-            '当前时期', '本人年龄', '本人性别', '本人姓名',
-            '本人身份证号', '本人身份证地址', '本人手机号', '用工单位'
-        ]
-
-        for field in required_fields:
-            if field not in variables or not variables[field]:
-                value = None
-
-                if field in ['本人年龄', '本人性别', '本人姓名', '本人身份证号', '本人身份证地址']:
-                    data_key = field if field.startswith('本人') else f'本人{field}'
-                    value = self.data_model.basic_info.get(data_key, '')
-
-                elif field == '用工单位':
-                    value = self.data_model.company_info.get('用工单位', '')
-
-                elif field == '当前时期':
-                    current_date = variables.get('当前日期', _date_now())
-                    current_time = variables.get('当前时间', _time_now())
-                    value = f"{current_date}{current_time}"
-
-                if not value:
-                    if field == '本人年龄' and self.age_pane.text():
-                        value = self.age_pane.text()
-                    elif field == '本人性别' and self.lineEdit.text():
-                        value = self.lineEdit.text()
-                    elif field == '本人姓名' and self.name_pane.text():
-                        value = self.name_pane.text()
-                    elif field == '本人手机号' and self.lineEdit_4.text():
-                        value = self.lineEdit_4.text()
-
-                if value:
-                    variables[field] = value
-
-        return variables
-
     def init_comboboxes(self):
         """初始化所有组合框"""
         self.init_combobox(self.company_pane, self.items_list1)
@@ -5255,27 +4780,6 @@ class MainWindow(QWidget, Ui_Form):
         except Exception as e:
             import traceback
             traceback.print_exc()
-
-    def work_talk(self):
-        """根据当前角色更新信息并保存案件"""
-        role = self.get_current_role_type()
-
-        # 工亡案件 + 本人角色：只保存信息创建案本号，不生成笔录（本人已故）
-        is_death = self.death_case_checkbox.isChecked()
-        if is_death and role == "本人":
-            self._save_death_case_info()
-            return
-
-        self.update_role_info(role)
-
-        if self.ai_service:
-            # AI 增强模式
-            self._transcript_with_ai(role)
-        else:
-            # 传统模式：直接走模板
-            self.discriminate()
-            self.work_save()
-
     def _save_death_case_info(self):
         """工亡案件：只保存本人信息 + 生成案本号 + 创建文件夹，不生成笔录"""
         try:
@@ -5358,182 +4862,6 @@ class MainWindow(QWidget, Ui_Form):
             import traceback
             traceback.print_exc()
             self._set_status(f"保存失败: {e}", "red")
-
-    def _transcript_with_ai(self, role: str):
-        """使用 AI 生成谈话笔录问答内容"""
-        try:
-            # 1. 案件分类
-            from case_classifier import CaseClassifier
-            classifier = CaseClassifier()
-            c = classifier.classify(self)
-            print(classifier.to_summary(c))
-
-            # 2. 构建 System Prompt（仅需角色）
-            from case_classifier import (
-                build_system_prompt, build_user_prompt, get_output_format_instruction
-            )
-            system_prompt = build_system_prompt(role)
-
-            # 案件陈述和材料清单
-            case_statement = ""
-            material_summary = ""
-            if hasattr(self, 'statement_edit'):
-                case_statement = self.statement_edit.toPlainText().strip()
-            if hasattr(self, 'material_list'):
-                material_summary = self.material_list.get_summary_text()
-
-            # 3. 证人/法人：读取本人笔录作为基础事实参考
-            person_transcript = ""
-            if role in ("证人", "法人"):
-                person_transcript = self._read_person_transcript()
-
-            user_prompt = build_user_prompt(
-                c, case_statement=case_statement, material_summary=material_summary,
-                person_transcript=person_transcript,
-            ) + "\n" + get_output_format_instruction()
-
-            # 3. 状态提示
-            self._set_status('正在AI生成谈话笔录...', 'black')
-            QApplication.processEvents()
-
-            # 4. 调用 AI
-            result = self.ai_service.generate_transcript(system_prompt, user_prompt)
-
-            if result.get("状态") == "成功":
-                self._ai_transcript_content = result.get("内容", "")
-                usage = result.get("用量", {})
-                prompt_tokens = usage.get("prompt_tokens", 0)
-                completion_tokens = usage.get("completion_tokens", 0)
-                total_tokens = usage.get("total_tokens", 0)
-                print(f"✅ AI 笔录生成完成: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
-                self._set_status(
-                    f'AI生成完成 (prompt:{prompt_tokens} completion:{completion_tokens})',
-                    'green'
-                )
-            else:
-                error_msg = result.get("错误信息", "未知错误")
-                print(f"⚠️ AI 生成失败: {error_msg}")
-                self._set_status(f'AI生成失败: {error_msg[:50]}，使用传统模板', 'orange')
-                self._ai_transcript_content = ""
-
-        except Exception as e:
-            print(f"❌ AI 生成异常: {e}")
-            import traceback
-            traceback.print_exc()
-            self._set_status('AI生成异常，使用传统模板', 'orange')
-            self._ai_transcript_content = ""
-
-        # 5. 继续保存流程（work_save 会检测并使用 AI 内容）
-        self.discriminate()
-        self.work_save()
-
-    def _read_person_transcript(self) -> str:
-        """读取本人笔录全文（证人/法人生成时作为基础事实参考）"""
-        try:
-            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                return ""
-            for fname in os.listdir(self.current_case_folder):
-                if fname.endswith('.docx') and '本人' in fname:
-                    fpath = os.path.join(self.current_case_folder, fname)
-                    doc = Document(fpath)
-                    text = "\n".join(
-                        p.text for p in doc.paragraphs if p.text.strip()
-                    )
-                    print(f"📄 读取本人笔录: {fname} ({len(text)}字符)")
-                    return text
-        except Exception as e:
-            print(f"⚠️ 读取本人笔录失败: {e}")
-        return ""
-
-    def _insert_ai_content_into_doc(self, file_path: str):
-        """
-        将 AI 生成的问答内容插入到已渲染的文档中。
-
-        策略：找到文档中第一个"问："段落（Q&A 正文起点的标记），
-        删除从该位置到文档末尾的所有内容，然后插入 AI 生成的问答。
-
-        Args:
-            file_path: 已渲染的 docx 文件路径
-        """
-        try:
-            from docx import Document
-            from docx.oxml.ns import qn
-            from docx.shared import Pt
-
-            ai_text = self._ai_transcript_content
-            if not ai_text:
-                return
-
-            doc = Document(file_path)
-            body = doc.element.body
-
-            # ── 找到第一个"问："段落，并收集要删除的元素 ──
-            elems_to_remove = []
-            found_qa = False
-            for child in list(body):
-                if child.tag == qn('w:p'):
-                    # 提取段落文本
-                    texts = []
-                    for t in child.iter(qn('w:t')):
-                        if t.text:
-                            texts.append(t.text)
-                    para_text = ''.join(texts).strip()
-
-                    if not found_qa and para_text.startswith('问：'):
-                        found_qa = True
-                    if found_qa:
-                        elems_to_remove.append(child)
-
-            # ── 删除旧的 Q&A 段落 ──
-            for elem in elems_to_remove:
-                body.remove(elem)
-
-            print(f"🗑️ 已移除 {len(elems_to_remove)} 个旧 Q&A 段落")
-
-            # ── 插入 AI 生成的问答内容 ──
-            lines = ai_text.strip().split('\n')
-            inserted_count = 0
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                p = doc.add_paragraph()
-
-                # 问答部分所有词都加下划线
-                run = p.add_run(line)
-                run.font.size = Pt(11)
-                run.underline = True
-
-                inserted_count += 1
-
-            doc.save(file_path)
-            print(f"✅ 已插入 {inserted_count} 个 AI 问答段落 → {file_path}")
-
-        except Exception as e:
-            print(f"❌ 插入 AI 内容失败: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def discriminate(self):
-        """生成模板文件路径"""
-        number = self.comboBox.currentIndex()
-        role = self.get_current_role_type()
-        has_construction_company = bool(self.construction_company.currentText())
-        has_construction_plant = bool(self.construction_plant.currentText())
-
-        # 获取案件配置
-        is_death_case, is_personal = self.get_current_case_config_tuple()
-
-        self.open_file_path = self.template_service.get_template_path(
-            role=role,
-            case_type=number,
-            is_death_case=is_death_case,
-            is_personal=is_personal
-        )
-        if not os.path.exists(self.open_file_path):
-            self._set_status('未找到模板文件，请检查配置', 'red')
-
     def process_id_info(self, role):
         """处理身份证信息并更新性别显示（使用DataService）"""
         try:
@@ -5565,30 +4893,6 @@ class MainWindow(QWidget, Ui_Form):
         elif self.radioButton_3.isChecked():
             return "法人"
         return "本人"
-
-    def get_current_case_config_tuple(self) -> tuple:
-        """获取案件配置（工亡/个人申请）"""
-        is_death_case = self.death_case_checkbox.isChecked()
-        is_personal = self.personal_application_checkbox.isChecked()
-        return is_death_case, is_personal
-
-    def need_special_questions(self) -> bool:
-        """判断是否需要插入特殊问题"""
-        is_death_case, is_personal = self.get_current_case_config_tuple()
-        return is_death_case or is_personal
-
-    def new_case(self):
-        """开始新案件"""
-        self.current_case_folder = None
-        self.current_person_name = ""
-        self.clear_fields()
-        self.lineEdit_2.clear()
-
-        # 重置谈话笔录按钮状态
-        print("🆕 开始新案件")
-
-        self._set_status('已开始新案件', 'green')
-
     def smart_search_cases(self):
         """按案本号在 cases_data.json 中模糊搜索，并回填主界面"""
         try:

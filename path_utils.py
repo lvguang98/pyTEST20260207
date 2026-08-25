@@ -6,7 +6,6 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional
 
 
 class PathUtils:
@@ -67,10 +66,6 @@ class PathUtils:
 
     # ============ 主要路径获取方法 ============
 
-    def get_app_root(self) -> Path:
-        """获取程序根目录"""
-        return self.app_root
-
     def get_template_path(self, *subpaths) -> Path:
         """获取模板路径"""
         return self.template_dir.joinpath(*subpaths)
@@ -98,34 +93,6 @@ class PathUtils:
     def get_users_file(self) -> Path:
         """获取users_api.json路径（保持原位）"""
         return self.data_dir / "users_api.json"
-
-    def get_api_configs_dir(self) -> Path:
-        """获取api_configs目录（保持原位）"""
-        return self.data_dir / "api_configs"
-
-    def get_full_path(self, path_type: str, *subpaths) -> Path:
-        """兼容ConfigService的接口"""
-        if path_type == "templates":
-            base = self.template_dir
-        elif path_type == "storage":
-            base = self.storage_dir
-        elif path_type == "config":
-            base = self.config_dir
-        elif path_type == "data":
-            base = self.data_dir
-        else:
-            base = self.app_root / path_type
-
-        full_path = base.joinpath(*subpaths)
-        full_path.mkdir(parents=True, exist_ok=True)
-        return full_path
-
-    def to_absolute(self, path_str: str) -> Path:
-        """将路径字符串转换为绝对路径"""
-        path = Path(path_str)
-        if path.is_absolute():
-            return path
-        return self.app_root / path
 
 
 # 全局单例实例
