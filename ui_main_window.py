@@ -157,7 +157,6 @@ class Ui_Form(object):
         self.pushButton_7.setObjectName("pushButton_7")
 
         self.retranslateUi(Form)
-        self.pushButton.clicked.connect(Form.work_talk) # type: ignore
         self.idnumer_pane.editingFinished.connect(Form.on_id_input_finished) # type: ignore
         self.pushButton_4.clicked.connect(Form.id_clicked) # type: ignore
         self.pushButton_2.clicked.connect(Form.save_company) # type: ignore
