@@ -2347,6 +2347,8 @@ class MainWindow(QWidget, Ui_Form):
                 "性别": self.lineEdit.text().strip(),
                 "年龄": self.age_pane.text().strip(),
             })
+            # 指向该证人，避免索引无效导致生成/回填拿不到证人数据
+            self.data_model.current_witness_index = self.data_model.witnesses.index(w)
         elif role == "法人":
             self.set_data('法人姓名', data['name_pane'], 'basic')
             self.set_data('法人身份证号', data['idnumer_pane'], 'basic')
@@ -3908,10 +3910,15 @@ class MainWindow(QWidget, Ui_Form):
         self.var_manager.clear_cache()
 
     def _ensure_current_witness(self):
-        """生成证人笔录前调用：若尚无当前证人，自动按顺序创建（证人一/证人二/…）"""
+        """生成证人笔录前调用：确保 current_witness_index 指向一个有效证人"""
         if self.get_current_role_type() != "证人":
             return
         if 0 <= self.data_model.current_witness_index < len(self.data_model.witnesses):
+            return
+        if self.data_model.witnesses:
+            # 已有证人但索引无效（如 F2 填充后未设索引）→ 指向第一个
+            self.data_model.current_witness_index = 0
+            self._refresh_witness_combo()
             return
         new_index = len(self.data_model.witnesses)
         new_witness = {
