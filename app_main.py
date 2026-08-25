@@ -1762,20 +1762,26 @@ class MainWindow(QWidget, Ui_Form):
                     anchor_pf = p.paragraph_format
                     break
 
-            # ── 3. 在锚点之后插入 AI 问答内容（去标题，按锚点格式：15号字不加粗），保留后面的样例正文 ──
-            if anchor_index is not None and anchor_index + 1 < len(doc.paragraphs):
-                next_p = doc.paragraphs[anchor_index + 1]
-            else:
-                next_p = None
+            if anchor_index is None:
+                print("⚠️ 未找到锚点「答：听清楚了，不申请回避」")
+                return ""
 
+            # ── 3. 删除锚点之后的模板样例问答（保留头部+告知，避免与AI问答重复）──
+            body = doc.element.body
+            anchor_elem = doc.paragraphs[anchor_index]._element
+            after_anchor = False
+            for child in list(body):
+                if after_anchor:
+                    body.remove(child)
+                elif child is anchor_elem:
+                    after_anchor = True
+
+            # ── 4. 在锚点之后插入 AI 问答（每行下划线）──
             for line in content.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                if next_p is not None:
-                    p = next_p.insert_paragraph_before()
-                else:
-                    p = doc.add_paragraph()
+                p = doc.add_paragraph()
                 if anchor_pf is not None:
                     p.paragraph_format.alignment = anchor_pf.alignment
                     p.paragraph_format.first_line_indent = anchor_pf.first_line_indent
