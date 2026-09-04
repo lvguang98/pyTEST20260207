@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import datetime
 import logging
 from typing import Dict, List, Any, Tuple, Optional
@@ -69,6 +70,65 @@ def _witness_label(n: int) -> str:
         body = _CN_DIGITS[tens] + "十" + (_CN_DIGITS[ones] if ones else "")
 
     return f"证人{body}"
+
+
+# ============================================================================
+# 统一"人记录"schema(本人/证人/法人共用一份字段结构)
+# ============================================================================
+
+# 一份"人记录"的规范英文键。case_obj 顶层的 本人 即 role=本人 的记录；
+# 证人 / 法人 数组元素 = 同样这些字段 + role(+ 可选 seq / materials)。
+PERSON_BASE_FIELDS = ("name", "gender", "age", "id_card", "address", "phone", "position")
+
+# canonical 英文键 → 中文后缀（用于拼 本人姓名/证人姓名/… 兼容扁平键）
+PERSON_CN_SUFFIX = {
+    "name": "姓名",
+    "gender": "性别",
+    "age": "年龄",
+    "id_card": "身份证号",
+    "address": "身份证地址",
+    "phone": "手机号",
+}
+# position 语义随角色：扁平兼容键 本人岗位/证人岗位/法人职务
+_FLAT_POSITION_SUFFIX = {"本人": "岗位", "证人": "岗位", "法人": "职务"}
+
+
+def person_flat_key(role: str, field: str) -> str:
+    """canonical 字段 → 角色前缀中文兼容扁平键，如 ('本人','name')→'本人姓名'、('法人','position')→'法人职务'"""
+    if field == "position":
+        return f"{role}{_FLAT_POSITION_SUFFIX.get(role, '岗位')}"
+    return f"{role}{PERSON_CN_SUFFIX.get(field, field)}"
+
+
+# 角色 → 谈话笔录生成配置（提示词 key / 笔录 docx 模板 / 模板占位符数据方法）——单一事实源
+ROLE_TALK = {
+    '本人': {
+        'ai_prompt': 'self_send_to_ai',
+        'talk_template': '本人谈话笔录（普通工伤案件）.docx',
+        'docx_data': '_build_unified_template_data',
+    },
+    '证人': {
+        'ai_prompt': 'witness_send_to_ai',
+        'talk_template': '证人谈话笔录（普通工伤案件）.docx',
+        'docx_data': '_build_witness_template_data',
+    },
+    '法人': {
+        'ai_prompt': 'legal_send_to_ai',
+        'talk_template': '法人谈话笔录（普通工伤案件）.docx',
+        'docx_data': '_build_legal_template_data',
+    },
+}
+
+
+def render_prompt_template(template: str, data: Dict[str, Any], label: str = '') -> str:
+    """按 data 逐个替换 {{key}} 占位符；替换后仍有残留 {{…}} 则告警（防止模板加了新占位符而代码未填）。"""
+    for key, val in data.items():
+        if val is not None:
+            template = template.replace('{{%s}}' % key, str(val))
+    leftovers = sorted(set(re.findall(r'\{\{([^}]*)\}\}', template)))
+    if leftovers:
+        print(f"⚠️ 提示词「{label}」仍有未替换占位符: {leftovers}")
+    return template
 
 
 # ============================================================================
@@ -681,7 +741,7 @@ class RegulationAnalyzeWorker(QThread):
             self.error.emit(str(e))
 
 class TranscriptFromTemplateWorker(QThread):
-    """把「发送给AI的模板」渲染全文发给 AI 生成询问笔录的线程"""
+    """把发给 AI 的提示词文本转发给 AIService 生成谈话笔录的后台线程（本人/证人/法人共用）"""
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
@@ -1251,29 +1311,32 @@ class MainWindow(QWidget, Ui_Form):
     def on_talk_button_clicked(self):
         """谈话笔录按钮点击事件处理 — 数据核对 + 按角色生成笔录"""
         try:
-            # 证人：先同步表单证人数据到数据模型（open_data_review 会回填本人数据，避免覆盖证人）
-            if self.get_current_role_type() == "证人":
+            # 证人/法人：核对前先把表单里新录的数据写回数据模型（open_data_review 保存后会把表单回填成本人数据）
+            current_role = self.get_current_role_type()
+            if current_role == "证人":
                 self._sync_form_to_current_witness()
+            elif current_role == "法人":
+                self.update_role_info('法人')
 
             # ── 第一步：弹出数据核对窗口，逐项核对并允许修改 ──
             if not self.open_data_review():
                 self._set_status('已取消', 'black')
                 return
 
-            # ── 第二步：按角色生成 ──
+            # ── 第二步：按角色生成（同一套代码路径，仅提示词/模板按角色区分）──
             role = self.get_current_role_type()
             if role == "证人":
                 # 数据核对会把表单回填成本人数据，这里把表单切回当前证人显示
                 self._sync_current_witness_to_form()
                 # 证人：跳过条例分析，直接生成证人谈话笔录
-                self._generate_witness_transcript()
+                self._generate_role_transcript('证人')
             elif role == "法人":
                 # 数据核对会把表单回填成本人数据，这里把表单切回法人显示
                 self._sync_legal_to_form()
                 # 法人：跳过条例分析，直接生成法人谈话笔录
-                self._generate_legal_transcript()
+                self._generate_role_transcript('法人')
             else:
-                # 本人：AI 条例判断 + 证据分析
+                # 本人：AI 条例判断 + 证据分析（分析完成后走同一 txt 提示词生成）
                 self._analyze_case_with_ai(self.current_case_id)
         except Exception as e:
             print(f"谈话笔录按钮点击异常: {e}")
@@ -1363,18 +1426,13 @@ class MainWindow(QWidget, Ui_Form):
         return data, materials, witnesses, legal_reps
 
     def _collect_legal_reps(self) -> List[Dict[str, Any]]:
-        """收集法人信息（当前系统法人是单条，通过 法人* 键存储，兼容未来多条）"""
-        name = self.get_data('法人姓名', '')
-        if not name:
+        """收集法人信息（当前系统法人是单条，统一为规范人记录；兼容未来多条）"""
+        person = self._person_from_flat('法人')
+        if not person.get('name'):
             return []
-        return [{
-            'name': name,
-            'position': self.get_data('法人职务', ''),
-            'id_card': self.get_data('法人身份证号', ''),
-            'address': self.get_data('法人身份证地址', ''),
-            'phone': self.get_data('法人手机号', ''),
-            'materials': self.data_model.investigation.get('法人材料', []),
-        }]
+        person['role'] = '法人'
+        person['materials'] = self.data_model.investigation.get('法人材料', [])
+        return [person]
 
     def _set_combo_or_type(self, combobox, text):
         """设置下拉框的值：存在则选中，否则输入（可编辑）或新增项（不可编辑）"""
@@ -1455,15 +1513,14 @@ class MainWindow(QWidget, Ui_Form):
             self.material_list.set_materials(materials_full)
         self.data_model.investigation['本人材料'] = materials_full
 
-        # 法人信息回写
+        # 法人信息回写（统一规范人记录 → 法人* 扁平兼容键，含性别/年龄）
         legal_reps = case_obj.get('legal_reps', [])
         if legal_reps:
             lr = legal_reps[0]
-            self.set_data('法人姓名', lr.get('name', ''), 'basic')
-            self.set_data('法人职务', lr.get('position', ''), 'basic')
-            self.set_data('法人身份证号', lr.get('id_card', ''), 'basic')
-            self.set_data('法人身份证地址', lr.get('address', ''), 'basic')
-            self.set_data('法人手机号', lr.get('phone', ''), 'basic')
+            for field in PERSON_BASE_FIELDS:
+                val = lr.get(field)
+                if val:
+                    self.set_data(person_flat_key('法人', field), val, 'basic')
             self.data_model.investigation['法人材料'] = lr.get('materials', [])
 
         # 刷新模板字典缓存
@@ -1656,97 +1713,129 @@ class MainWindow(QWidget, Ui_Form):
         if '错误' in result:
             QMessageBox.warning(self, "AI分析失败", result.get('错误', '未知错误'))
             return
-        # AI 分析完成后，用案件数据渲染「发送给AI的模板」并打开给用户查看
-        self._generate_ai_template_and_open(case_id)
+        # AI 分析完成后，用统一「本人发送给AI提示词」（txt）生成询问笔录，不再用 docx 当提示词
+        case_obj = self._load_cases_data().get(case_id)
+        if case_obj:
+            prompt_text = self._build_prompt_for_role('本人', case_obj)
+            self._start_transcript_generation('本人', case_id, case_obj, prompt_text)
         self._show_regulation_analysis(case_id, result)
 
-    def _generate_ai_template_and_open(self, case_id: str):
-        """AI 条例与证据分析完成后，内存渲染「发送给AI的模板」→ 把全文直接发给 AI 生成询问笔录（不再生成/打开 docx）"""
-        try:
-            case_obj = self._load_cases_data().get(case_id)
-            if not case_obj:
-                print(f"⚠️ 生成「发送给AI」全文失败：未找到案件数据（{case_id}）")
-                return
-
-            # ── 1. 构建模板数据（统一中文占位符，附带英文 key）──
-            template_data = self._build_unified_template_data(case_obj)
-
-            # ── 2. 获取模板路径 ──
-            template_path = str(path_utils.get_document_template_path('发送给AI的模板.docx'))
-            if not os.path.exists(template_path):
-                print(f"⚠️ 模板文件不存在: {template_path}")
-                return
-
-            # ── 3. 渲染模板（内存中，不落盘）──
-            from docxtpl import DocxTemplate
-            word = DocxTemplate(template_path)
-            word.render(template_data)
-
-            # ── 4. 从内存提取渲染后的全文（不再生成/打开「发送给AI」docx）──
-            import io as _io
-            buf = _io.BytesIO()
-            word.save(buf)
-            buf.seek(0)
-            from docx import Document
-            rendered = Document(buf)
-            full_text = "\n".join(p.text for p in rendered.paragraphs if p.text.strip())
-            print(f"📝 提取模板全文 {len(full_text)} 字符，准备发送给 AI")
-
-            # ── 5. 把全文发给 AI 生成询问笔录（后台线程）──
-            self._start_transcript_generation(case_id, case_obj, full_text)
-
-        except Exception as e:
-            print(f"❌ 生成「发送给AI」全文异常: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _start_transcript_generation(self, case_id: str, case_obj: dict, full_text: str):
-        """启动后台线程，把模板全文发给 AI 生成询问笔录"""
-        self._set_status('正在AI生成询问笔录...', 'black')
+    def _start_transcript_generation(self, role: str, case_id: str, case_obj: dict, prompt_text: str):
+        """统一的笔录生成启动（本人/证人/法人共用一条代码路径）：txt 提示词 → AI 后台线程"""
+        self._set_status(f'正在AI生成{role}谈话笔录...', 'black')
         QApplication.processEvents()
-        self.transcript_worker = TranscriptFromTemplateWorker(self.ai_service, full_text)
+        self.transcript_worker = TranscriptFromTemplateWorker(self.ai_service, prompt_text)
         self.transcript_worker.finished.connect(
-            lambda result, cid=case_id, co=case_obj: self._on_transcript_generated(cid, co, result)
+            lambda result, r=role, cid=case_id, co=case_obj: self._on_transcript_generated(r, cid, co, result)
         )
         self.transcript_worker.error.connect(self._on_transcript_error)
         self.transcript_worker.start()
 
-    def _on_transcript_generated(self, case_id: str, case_obj: dict, result: dict):
+    def _prompt_fill_data(self, role: str, case_obj: dict) -> Dict[str, Any]:
+        """返回用于填充该角色「发给AI」提示词的数据（case_obj + 当前人记录/法人flat 兼容键）"""
+        if role == '证人':
+            self._ensure_current_witness()
+            # 不调用 _sync_form_to_current_witness（open_data_review 已把表单回填成本人数据，会污染证人）
+            w = self._current_witness() or {}
+            return {
+                '案本号': case_obj.get('case_id', ''),
+                '案件性质': case_obj.get('case_nature', ''),
+                '申请类型': case_obj.get('applicant_type', ''),
+                '本人姓名': case_obj.get('name', ''),
+                '本人性别': case_obj.get('gender', ''),
+                '本人身份证号': case_obj.get('id_card', ''),
+                '用人单位': case_obj.get('labor_unit', ''),
+                '用工单位': case_obj.get('employer', ''),
+                '工地名称': case_obj.get('site', ''),
+                '受伤经过': case_obj.get('injury_description', ''),
+                '证人姓名': w.get('name', '') or self.get_data('证人姓名', ''),
+                '证人身份证号': w.get('id_card', '') or self.get_data('证人身份证号', ''),
+                '证人岗位': w.get('position', '') or self.get_data('证人岗位', ''),
+            }
+        if role == '法人':
+            return {
+                '案本号': case_obj.get('case_id', ''),
+                '案件性质': case_obj.get('case_nature', ''),
+                '申请类型': case_obj.get('applicant_type', ''),
+                '本人姓名': case_obj.get('name', ''),
+                '本人性别': case_obj.get('gender', ''),
+                '本人身份证号': case_obj.get('id_card', ''),
+                '用人单位': case_obj.get('labor_unit', ''),
+                '用工单位': case_obj.get('employer', ''),
+                '工地名称': case_obj.get('site', ''),
+                '受伤经过': case_obj.get('injury_description', ''),
+                '法人姓名': self.get_data('法人姓名', ''),
+                '法人职务': self.get_data('法人职务', ''),
+                '法人身份证号': self.get_data('法人身份证号', ''),
+            }
+        # 本人：复用统一模板数据（中文+英文 key 富余项替换无害）
+        return self._build_unified_template_data(case_obj)
+
+    def _build_prompt_for_role(self, role: str, case_obj: dict) -> str:
+        """按角色返回发给 AI 的 txt 提示词（ROLE_TALK 定 key，统一渲染并校验残留占位符）"""
+        from prompt_manager import load_prompt
+        meta = ROLE_TALK.get(role, ROLE_TALK['本人'])
+        prompt = load_prompt(meta['ai_prompt'])
+        return render_prompt_template(prompt, self._prompt_fill_data(role, case_obj), role)
+
+    def _generate_role_transcript(self, role: str):
+        """统一的谈话笔录生成入口（证人/法人由此进入；本人经条例分析后直接调 _start_transcript_generation）"""
+        case_id = self.current_case_id or self.lineEdit_2.text().strip()
+        if not case_id:
+            self._set_status(f'无案本号，无法生成{role}笔录', 'orange')
+            return
+        if not self.ai_service:
+            self._set_status('未配置AI，无法生成笔录', 'orange')
+            QMessageBox.warning(self, "提示", f"未配置API密钥，无法生成{role}谈话笔录。\n请在顶部⚙配置中设置API密钥。")
+            return
+        case_obj = self._load_cases_data().get(case_id)
+        if not case_obj:
+            self._set_status('未找到该案本号的案件数据', 'orange')
+            return
+        prompt_text = self._build_prompt_for_role(role, case_obj)
+        self._start_transcript_generation(role, case_id, case_obj, prompt_text)
+
+    def _on_transcript_generated(self, role: str, case_id: str, case_obj: dict, result: dict):
         if result.get("状态") != "成功":
             err = result.get("错误信息", "未知错误")
-            print(f"⚠️ 询问笔录生成失败: {err}")
-            self._set_status(f'询问笔录生成失败: {err[:40]}', 'orange')
+            print(f"⚠️ {role}谈话笔录生成失败: {err}")
+            self._set_status(f'{role}谈话笔录生成失败: {err[:40]}', 'orange')
             return
         content = (result.get("内容", "") or "").strip()
         if not content:
-            print("⚠️ 询问笔录生成失败：AI 返回内容为空")
-            self._set_status('询问笔录生成失败：AI 返回内容为空', 'orange')
+            print(f"⚠️ {role}谈话笔录生成失败：AI 返回内容为空")
+            self._set_status(f'{role}谈话笔录生成失败：AI 返回内容为空', 'orange')
             return
-        path = self._save_transcript_to_template(case_obj, content)
+        path = self._save_transcript_to_template(case_obj, content, role)
         if not path:
             return
+        if role == '证人':
+            self._save_witnesses()  # 持久化证人数据
         success, message = self.file_service.open_document(path)
         if success:
-            self._set_status('已生成并打开本人谈话笔录', 'green')
+            self._set_status(f'已生成并打开{role}谈话笔录', 'green')
         else:
-            self._set_status(f'本人谈话笔录已生成，打开失败: {message}', 'orange')
+            self._set_status(f'{role}谈话笔录已生成，打开失败: {message}', 'orange')
 
     def _on_transcript_error(self, err: str):
         print(f"❌ 询问笔录生成出错: {err}")
         self._set_status('询问笔录生成出错', 'red')
 
-    def _save_transcript_to_template(self, case_obj: dict, content: str) -> str:
-        """渲染「本人谈话笔录（普通工伤案件）.docx」模板，把 AI 生成的问答内容（去标题）插入到告知程序之后，返回文件路径（失败返回空串）"""
+    def _save_transcript_to_template(self, case_obj: dict, content: str, role: str = '本人') -> str:
+        """渲染「{role}谈话笔录（普通工伤案件）.docx」模板，把 AI 问答插入到告知程序之后，返回文件路径（失败返回空串）。
+        本人/证人/法人共用同一条逻辑，仅按角色选择模板与占位符数据。"""
         try:
             from docx.shared import Pt
+            meta = ROLE_TALK.get(role, ROLE_TALK['本人'])
+            label = f'{role}谈话笔录'
 
             # ── 1. 渲染谈话模板（替换占位符）──
-            template_path = str(path_utils.get_talk_template_path('本人谈话笔录（普通工伤案件）.docx'))
+            template_path = str(path_utils.get_talk_template_path(meta['talk_template']))
             if not os.path.exists(template_path):
                 print(f"⚠️ 谈话模板不存在: {template_path}")
                 return ""
 
-            template_data = self._build_unified_template_data(case_obj)
+            template_data = getattr(self, meta['docx_data'])(case_obj)
 
             # ── 1.1 用 docxtpl 渲染占位符（保留占位符原有格式）──
             from docxtpl import DocxTemplate
@@ -1798,54 +1887,27 @@ class MainWindow(QWidget, Ui_Form):
                 os.makedirs(self.current_case_folder, exist_ok=True)
 
             subject = str(case_obj.get('name', '') or case_obj.get('case_id', '') or '案件').strip()
-            file_name = f"{subject}本人谈话笔录.docx"
+            file_name = f"{subject}{label}.docx"
             target_path = os.path.join(self.current_case_folder, file_name)
             counter = 2
             while os.path.exists(target_path):
-                file_name = f"{subject}本人谈话笔录({counter}).docx"
+                file_name = f"{subject}{label}({counter}).docx"
                 target_path = os.path.join(self.current_case_folder, file_name)
                 counter += 1
 
             doc.save(target_path)
-            print(f"✅ 本人谈话笔录已生成: {target_path}")
+            print(f"✅ {label}已生成: {target_path}")
             return target_path
         except Exception as e:
-            print(f"❌ 生成本人谈话笔录失败: {e}")
+            print(f"❌ 生成{role}谈话笔录失败: {e}")
             import traceback
             traceback.print_exc()
-            self._set_status('生成本人谈话笔录失败', 'red')
+            self._set_status(f'生成{role}谈话笔录失败', 'red')
             return ""
 
     # ========================================================================
-    # 证人谈话笔录生成（仿本人流程，跳过条例分析）
+    # 证人谈话笔录：提示词 / 模板占位符数据（生成统一走 _generate_role_transcript）
     # ========================================================================
-
-    def _build_witness_ai_prompt(self, case_obj: dict) -> str:
-        """构建证人谈话笔录的 AI 提示词（案件数据 + 当前证人 替换占位符）"""
-        from prompt_manager import load_prompt
-        self._ensure_current_witness()
-        # 注意：不调用 _sync_form_to_current_witness（open_data_review 已把表单回填成本人数据，会污染证人）
-        w = self._current_witness() or {}
-
-        prompt = load_prompt('witness_send_to_ai')
-        replacements = {
-            '案本号': case_obj.get('case_id', ''),
-            '案件性质': case_obj.get('case_nature', ''),
-            '申请类型': case_obj.get('applicant_type', ''),
-            '本人姓名': case_obj.get('name', ''),
-            '本人性别': case_obj.get('gender', ''),
-            '本人身份证号': case_obj.get('id_card', ''),
-            '用人单位': case_obj.get('labor_unit', ''),
-            '用工单位': case_obj.get('employer', ''),
-            '工地名称': case_obj.get('site', ''),
-            '受伤经过': case_obj.get('injury_description', ''),
-            '证人姓名': w.get('姓名', '') or self.get_data('证人姓名', ''),
-            '证人身份证号': w.get('身份证号', '') or self.get_data('证人身份证号', ''),
-            '证人岗位': w.get('岗位', '') or self.get_data('证人岗位', ''),
-        }
-        for key, val in replacements.items():
-            prompt = prompt.replace('{{%s}}' % key, str(val))
-        return prompt
 
     def _build_witness_template_data(self, case_obj: dict) -> dict:
         """构建证人谈话笔录模板的占位符数据"""
@@ -1856,181 +1918,26 @@ class MainWindow(QWidget, Ui_Form):
             '当前时期': self.get_data('当前时期', '') or (_date_now() + _time_now()),
             '用户名': self._get_current_username(),
             '本人姓名': case_obj.get('name', ''),
-            '证人姓名': w.get('姓名', '') or self.get_data('证人姓名', ''),
-            '证人性别': w.get('性别', '') or self.get_data('证人性别', ''),
-            '证人年龄': w.get('年龄', '') or self.get_data('证人年龄', ''),
-            '证人身份证号': w.get('身份证号', '') or self.get_data('证人身份证号', ''),
-            '证人身份证地址': w.get('身份证地址', '') or self.get_data('证人身份证地址', ''),
-            '证人手机号': w.get('手机号', '') or self.get_data('证人手机号', ''),
-            '证人岗位': w.get('岗位', '') or self.get_data('证人岗位', ''),
+            '证人姓名': w.get('name', '') or self.get_data('证人姓名', ''),
+            '证人性别': w.get('gender', '') or self.get_data('证人性别', ''),
+            '证人年龄': w.get('age', '') or self.get_data('证人年龄', ''),
+            '证人身份证号': w.get('id_card', '') or self.get_data('证人身份证号', ''),
+            '证人身份证地址': w.get('address', '') or self.get_data('证人身份证地址', ''),
+            '证人手机号': w.get('phone', '') or self.get_data('证人手机号', ''),
+            '证人岗位': w.get('position', '') or self.get_data('证人岗位', ''),
             '公司名称': case_obj.get('labor_unit', ''),  # 用人单位（签合同的单位）
         }
 
-    def _generate_witness_transcript(self):
-        """证人谈话笔录：构建提示词 → 发给AI → 渲染模板+插入（跳过条例分析）"""
-        case_id = self.current_case_id or self.lineEdit_2.text().strip()
-        if not case_id:
-            self._set_status('无案本号，无法生成证人笔录', 'orange')
-            return
-        if not self.ai_service:
-            self._set_status('未配置AI，无法生成证人笔录', 'orange')
-            QMessageBox.warning(self, "提示", "未配置API密钥，无法生成证人笔录。\n请在顶部⚙配置中设置API密钥。")
-            return
-        case_obj = self._load_cases_data().get(case_id)
-        if not case_obj:
-            self._set_status('未找到该案本号的案件数据', 'orange')
-            return
-
-        prompt_text = self._build_witness_ai_prompt(case_obj)
-
-        self._set_status('正在AI生成证人谈话笔录...', 'black')
-        QApplication.processEvents()
-
-        self.witness_transcript_worker = TranscriptFromTemplateWorker(self.ai_service, prompt_text)
-        self.witness_transcript_worker.finished.connect(
-            lambda result, cid=case_id, co=case_obj: self._on_witness_transcript_generated(cid, co, result)
-        )
-        self.witness_transcript_worker.error.connect(self._on_transcript_error)
-        self.witness_transcript_worker.start()
-
-    def _on_witness_transcript_generated(self, case_id: str, case_obj: dict, result: dict):
-        if result.get("状态") != "成功":
-            err = result.get("错误信息", "未知错误")
-            print(f"⚠️ 证人谈话笔录生成失败: {err}")
-            self._set_status(f'证人谈话笔录生成失败: {err[:40]}', 'orange')
-            return
-        content = (result.get("内容", "") or "").strip()
-        if not content:
-            print("⚠️ 证人谈话笔录生成失败：AI 返回内容为空")
-            self._set_status('证人谈话笔录生成失败：AI 返回内容为空', 'orange')
-            return
-        path = self._save_witness_transcript_to_template(case_obj, content)
-        if not path:
-            return
-        self._save_witnesses()  # 持久化证人数据
-        success, message = self.file_service.open_document(path)
-        if success:
-            self._set_status('已生成并打开证人谈话笔录', 'green')
-        else:
-            self._set_status(f'证人谈话笔录已生成，打开失败: {message}', 'orange')
-
-    def _save_witness_transcript_to_template(self, case_obj: dict, content: str) -> str:
-        """渲染「证人谈话笔录（普通工伤案件）.docx」模板，删除样例问答后插入 AI 问答（下划线），返回路径"""
-        try:
-            from docx.shared import Pt
-
-            # ── 1. 渲染证人谈话模板（替换占位符）──
-            template_path = str(path_utils.get_talk_template_path('证人谈话笔录（普通工伤案件）.docx'))
-            if not os.path.exists(template_path):
-                print(f"⚠️ 证人谈话模板不存在: {template_path}")
-                return ""
-
-            template_data = self._build_witness_template_data(case_obj)
-
-            from docxtpl import DocxTemplate
-            doc = DocxTemplate(template_path)
-            doc.render(template_data)
-
-            # ── 2. 定位锚点「答：听清楚了，不申请回避」──
-            anchor_index = None
-            anchor_pf = None
-            for i, p in enumerate(doc.paragraphs):
-                if '答：听清楚了，不申请回避' in p.text:
-                    anchor_index = i
-                    anchor_pf = p.paragraph_format
-                    break
-            if anchor_index is None:
-                print("⚠️ 未找到锚点「答：听清楚了，不申请回避」")
-                return ""
-
-            # ── 3. 删除锚点之后的模板样例问答（保留头部+告知，避免与AI问答重复）──
-            body = doc.element.body
-            anchor_elem = doc.paragraphs[anchor_index]._element
-            after_anchor = False
-            for child in list(body):
-                if after_anchor:
-                    body.remove(child)
-                elif child is anchor_elem:
-                    after_anchor = True
-
-            # ── 4. 在锚点之后插入 AI 问答（每行下划线）──
-            for line in content.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                p = doc.add_paragraph()
-                if anchor_pf is not None:
-                    p.paragraph_format.alignment = anchor_pf.alignment
-                    p.paragraph_format.first_line_indent = anchor_pf.first_line_indent
-                    p.paragraph_format.space_before = anchor_pf.space_before
-                    p.paragraph_format.space_after = anchor_pf.space_after
-                run = p.add_run(line)
-                run.font.size = Pt(15)
-                run.underline = True
-
-            # ── 5. 保存 ──
-            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                folder_subject = str(case_obj.get('case_id', '') or case_obj.get('name', '') or '案件').strip()
-                self.current_case_folder = os.path.join(self.BASE_PATH, folder_subject)
-                os.makedirs(self.current_case_folder, exist_ok=True)
-
-            subject = str(case_obj.get('name', '') or case_obj.get('case_id', '') or '案件').strip()
-            file_name = f"{subject}证人谈话笔录.docx"
-            target_path = os.path.join(self.current_case_folder, file_name)
-            counter = 2
-            while os.path.exists(target_path):
-                file_name = f"{subject}证人谈话笔录({counter}).docx"
-                target_path = os.path.join(self.current_case_folder, file_name)
-                counter += 1
-
-            doc.save(target_path)
-            print(f"✅ 证人谈话笔录已生成: {target_path}")
-            return target_path
-        except Exception as e:
-            print(f"❌ 生成证人谈话笔录失败: {e}")
-            import traceback
-            traceback.print_exc()
-            self._set_status('生成证人谈话笔录失败', 'red')
-            return ""
 
     # ========================================================================
-    # 法人谈话笔录生成（仿证人流程，跳过条例分析）
+    # 法人谈话笔录：表单同步 + 提示词 / 模板占位符数据（生成统一走 _generate_role_transcript）
     # ========================================================================
 
     def _sync_legal_to_form(self):
         """数据核对后把表单切回法人数据（open_data_review 会把表单回填成本人数据）"""
         if self.get_current_role_type() != "法人":
             return
-        self.name_pane.setText(self.get_data('法人姓名', ''))
-        self.idnumer_pane.setText(self.get_data('法人身份证号', ''))
-        self.textEdit.setPlainText(self.get_data('法人身份证地址', ''))
-        self.lineEdit_4.setText(self.get_data('法人手机号', ''))
-        self.lineEdit_5.setText(self.get_data('法人职务', ''))
-        self.lineEdit.setText(self.get_data('法人性别', ''))
-        self.age_pane.setText(str(self.get_data('法人年龄', '')))
-
-    def _build_legal_ai_prompt(self, case_obj: dict) -> str:
-        """构建法人谈话笔录的 AI 提示词（案件数据 + 法人数据 替换占位符）"""
-        from prompt_manager import load_prompt
-        prompt = load_prompt('legal_send_to_ai')
-        replacements = {
-            '案本号': case_obj.get('case_id', ''),
-            '案件性质': case_obj.get('case_nature', ''),
-            '申请类型': case_obj.get('applicant_type', ''),
-            '本人姓名': case_obj.get('name', ''),
-            '本人性别': case_obj.get('gender', ''),
-            '本人身份证号': case_obj.get('id_card', ''),
-            '用人单位': case_obj.get('labor_unit', ''),
-            '用工单位': case_obj.get('employer', ''),
-            '工地名称': case_obj.get('site', ''),
-            '受伤经过': case_obj.get('injury_description', ''),
-            '法人姓名': self.get_data('法人姓名', ''),
-            '法人职务': self.get_data('法人职务', ''),
-            '法人身份证号': self.get_data('法人身份证号', ''),
-        }
-        for key, val in replacements.items():
-            prompt = prompt.replace('{{%s}}' % key, str(val))
-        return prompt
+        self._write_person_to_form(self._person_from_flat('法人'))
 
     def _build_legal_template_data(self, case_obj: dict) -> dict:
         """构建法人谈话笔录模板的占位符数据"""
@@ -2048,131 +1955,6 @@ class MainWindow(QWidget, Ui_Form):
             '公司名称': case_obj.get('labor_unit', ''),  # 用人单位（签合同的单位）
         }
 
-    def _generate_legal_transcript(self):
-        """法人谈话笔录：构建提示词 → 发给AI → 渲染模板+插入（跳过条例分析）"""
-        case_id = self.current_case_id or self.lineEdit_2.text().strip()
-        if not case_id:
-            self._set_status('无案本号，无法生成法人笔录', 'orange')
-            return
-        if not self.ai_service:
-            self._set_status('未配置AI，无法生成法人笔录', 'orange')
-            QMessageBox.warning(self, "提示", "未配置API密钥，无法生成法人笔录。\n请在顶部⚙配置中设置API密钥。")
-            return
-        case_obj = self._load_cases_data().get(case_id)
-        if not case_obj:
-            self._set_status('未找到该案本号的案件数据', 'orange')
-            return
-
-        prompt_text = self._build_legal_ai_prompt(case_obj)
-
-        self._set_status('正在AI生成法人谈话笔录...', 'black')
-        QApplication.processEvents()
-
-        self.legal_transcript_worker = TranscriptFromTemplateWorker(self.ai_service, prompt_text)
-        self.legal_transcript_worker.finished.connect(
-            lambda result, cid=case_id, co=case_obj: self._on_legal_transcript_generated(cid, co, result)
-        )
-        self.legal_transcript_worker.error.connect(self._on_transcript_error)
-        self.legal_transcript_worker.start()
-
-    def _on_legal_transcript_generated(self, case_id: str, case_obj: dict, result: dict):
-        if result.get("状态") != "成功":
-            err = result.get("错误信息", "未知错误")
-            print(f"⚠️ 法人谈话笔录生成失败: {err}")
-            self._set_status(f'法人谈话笔录生成失败: {err[:40]}', 'orange')
-            return
-        content = (result.get("内容", "") or "").strip()
-        if not content:
-            print("⚠️ 法人谈话笔录生成失败：AI 返回内容为空")
-            self._set_status('法人谈话笔录生成失败：AI 返回内容为空', 'orange')
-            return
-        path = self._save_legal_transcript_to_template(case_obj, content)
-        if not path:
-            return
-        success, message = self.file_service.open_document(path)
-        if success:
-            self._set_status('已生成并打开法人谈话笔录', 'green')
-        else:
-            self._set_status(f'法人谈话笔录已生成，打开失败: {message}', 'orange')
-
-    def _save_legal_transcript_to_template(self, case_obj: dict, content: str) -> str:
-        """渲染「法人谈话笔录（普通工伤案件）.docx」模板，删除样例问答后插入 AI 问答（下划线），返回路径"""
-        try:
-            from docx.shared import Pt
-
-            # ── 1. 渲染法人谈话模板（替换占位符）──
-            template_path = str(path_utils.get_talk_template_path('法人谈话笔录（普通工伤案件）.docx'))
-            if not os.path.exists(template_path):
-                print(f"⚠️ 法人谈话模板不存在: {template_path}")
-                return ""
-
-            template_data = self._build_legal_template_data(case_obj)
-
-            from docxtpl import DocxTemplate
-            doc = DocxTemplate(template_path)
-            doc.render(template_data)
-
-            # ── 2. 定位锚点「答：听清楚了，不申请回避」──
-            anchor_index = None
-            anchor_pf = None
-            for i, p in enumerate(doc.paragraphs):
-                if '答：听清楚了，不申请回避' in p.text:
-                    anchor_index = i
-                    anchor_pf = p.paragraph_format
-                    break
-            if anchor_index is None:
-                print("⚠️ 未找到锚点「答：听清楚了，不申请回避」")
-                return ""
-
-            # ── 3. 删除锚点之后的模板样例问答（保留头部+告知，避免与AI问答重复）──
-            body = doc.element.body
-            anchor_elem = doc.paragraphs[anchor_index]._element
-            after_anchor = False
-            for child in list(body):
-                if after_anchor:
-                    body.remove(child)
-                elif child is anchor_elem:
-                    after_anchor = True
-
-            # ── 4. 在锚点之后插入 AI 问答（每行下划线）──
-            for line in content.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                p = doc.add_paragraph()
-                if anchor_pf is not None:
-                    p.paragraph_format.alignment = anchor_pf.alignment
-                    p.paragraph_format.first_line_indent = anchor_pf.first_line_indent
-                    p.paragraph_format.space_before = anchor_pf.space_before
-                    p.paragraph_format.space_after = anchor_pf.space_after
-                run = p.add_run(line)
-                run.font.size = Pt(15)
-                run.underline = True
-
-            # ── 5. 保存 ──
-            if not self.current_case_folder or not os.path.exists(self.current_case_folder):
-                folder_subject = str(case_obj.get('case_id', '') or case_obj.get('name', '') or '案件').strip()
-                self.current_case_folder = os.path.join(self.BASE_PATH, folder_subject)
-                os.makedirs(self.current_case_folder, exist_ok=True)
-
-            subject = str(case_obj.get('name', '') or case_obj.get('case_id', '') or '案件').strip()
-            file_name = f"{subject}法人谈话笔录.docx"
-            target_path = os.path.join(self.current_case_folder, file_name)
-            counter = 2
-            while os.path.exists(target_path):
-                file_name = f"{subject}法人谈话笔录({counter}).docx"
-                target_path = os.path.join(self.current_case_folder, file_name)
-                counter += 1
-
-            doc.save(target_path)
-            print(f"✅ 法人谈话笔录已生成: {target_path}")
-            return target_path
-        except Exception as e:
-            print(f"❌ 生成法人谈话笔录失败: {e}")
-            import traceback
-            traceback.print_exc()
-            self._set_status('生成法人谈话笔录失败', 'red')
-            return ""
 
     def _on_analysis_error(self, err: str):
         self._set_status('AI分析出错', 'red')
@@ -2331,36 +2113,20 @@ class MainWindow(QWidget, Ui_Form):
         # ── 自动计算年龄和性别 ──
         self.on_id_input_finished()
 
-        # ── 同步角色数据到数据模型，供 JSON 保存（本人=键，证人是列表，法人是单条键） ──
+        # ── 同步角色数据到数据模型，供 JSON 保存（统一人记录 schema） ──
         role = self.get_current_role_type()
-        if role == "本人":
-            self.set_data('本人姓名', data['name_pane'], 'basic')
-            self.set_data('本人手机号', data['lineEdit_4'], 'basic')
-            self.set_data('本人身份证地址', data['textEdit'], 'basic')
-            self.set_data('本人岗位', data['lineEdit_5'], 'basic')
-        elif role == "证人":
+        if role == "证人":
             name = data['name_pane']
-            w = next((x for x in self.data_model.witnesses if x.get('姓名') == name), None)
+            w = next((x for x in self.data_model.witnesses if x.get('name') == name), None)
             if w is None:
-                w = {"序号": _witness_label(len(self.data_model.witnesses) + 1)}
+                w = {"role": "证人", "seq": _witness_label(len(self.data_model.witnesses) + 1)}
                 self.data_model.witnesses.append(w)
-            w.update({
-                "姓名": name,
-                "身份证号": data['idnumer_pane'],
-                "身份证地址": data['textEdit'],
-                "手机号": data['lineEdit_4'],
-                "岗位": data['lineEdit_5'],
-                "性别": self.lineEdit.text().strip(),
-                "年龄": self.age_pane.text().strip(),
-            })
+            w.update(self._read_form_as_person())
             # 指向该证人，避免索引无效导致生成/回填拿不到证人数据
             self.data_model.current_witness_index = self.data_model.witnesses.index(w)
-        elif role == "法人":
-            self.set_data('法人姓名', data['name_pane'], 'basic')
-            self.set_data('法人身份证号', data['idnumer_pane'], 'basic')
-            self.set_data('法人身份证地址', data['textEdit'], 'basic')
-            self.set_data('法人手机号', data['lineEdit_4'], 'basic')
-            self.set_data('法人职务', data['lineEdit_5'], 'basic')
+        else:
+            # 本人 / 法人：表单 → 角色前缀扁平兼容键（统一走 _read_form_as_person）
+            self._person_to_flat(role, self._read_form_as_person())
 
         # ── 右侧面板（同案沿用） ──
         current_worker = data.get("injured_worker", "")
@@ -3755,6 +3521,50 @@ class MainWindow(QWidget, Ui_Form):
         except Exception as e:
             print(f"⚠️ 应用UI设置失败: {e}")
 
+    # ========================================================================
+    # 统一"人记录"助手（表单 ↔ 英文 schema ↔ 中文兼容扁平键）
+    # ========================================================================
+
+    def _read_form_as_person(self) -> Dict[str, Any]:
+        """把共享表单控件读成统一人记录（英文 schema，不含 role）"""
+        return {
+            'name': self.name_pane.text().strip(),
+            'gender': self.lineEdit.text().strip(),
+            'age': self.age_pane.text().strip(),
+            'id_card': self.idnumer_pane.text().strip(),
+            'address': self.textEdit.toPlainText().strip(),
+            'phone': self.lineEdit_4.text().strip(),
+            'position': self.lineEdit_5.text().strip(),
+        }
+
+    def _write_person_to_form(self, person: Dict[str, Any]):
+        """把统一人记录（英文 schema）回填共享表单控件（不写数据模型）"""
+        def _txt(person, key):
+            v = person.get(key)
+            return "" if v is None else str(v)
+
+        self.name_pane.setText(_txt(person, 'name'))
+        self.lineEdit.setText(_txt(person, 'gender'))
+        self.age_pane.setText(_txt(person, 'age'))
+        self.idnumer_pane.setText(_txt(person, 'id_card'))
+        self.textEdit.setPlainText(_txt(person, 'address'))
+        self.lineEdit_4.setText(_txt(person, 'phone'))
+        self.lineEdit_5.setText(_txt(person, 'position'))
+
+    def _person_to_flat(self, role: str, person: Dict[str, Any]):
+        """统一人记录 → 兼容扁平中文键（本人姓名/证人姓名/…，经 set_data 入 basic_info）"""
+        for field in PERSON_BASE_FIELDS:
+            val = person.get(field)
+            if val:
+                self.set_data(person_flat_key(role, field), val, 'basic')
+
+    def _person_from_flat(self, role: str) -> Dict[str, Any]:
+        """兼容扁平中文键 → 统一人记录（英文 schema，字符串；缺值置空）"""
+        return {
+            field: str(self.get_data(person_flat_key(role, field), '') or '')
+            for field in PERSON_BASE_FIELDS
+        }
+
     def clear_role_fields(self):
         """
         清空当前角色的字段
@@ -3850,27 +3660,18 @@ class MainWindow(QWidget, Ui_Form):
         self.witness_combo.blockSignals(True)
         self.witness_combo.clear()
         for w in self.data_model.witnesses:
-            name = w.get("姓名") or "未命名"
-            self.witness_combo.addItem(f"{w.get('序号', '')} · {name}")
+            name = w.get("name") or "未命名"
+            self.witness_combo.addItem(f"{w.get('seq', '')} · {name}")
         if 0 <= self.data_model.current_witness_index < self.witness_combo.count():
             self.witness_combo.setCurrentIndex(self.data_model.current_witness_index)
         self.witness_combo.blockSignals(False)
 
     def _mirror_witness_to_flat(self, w: Dict[str, Any]):
-        """把证人 dict 同步到扁平 证人* 键（供模板/AI 使用）"""
-        mapping = [
-            ("姓名", "证人姓名"),
-            ("身份证号", "证人身份证号"),
-            ("身份证地址", "证人身份证地址"),
-            ("手机号", "证人手机号"),
-            ("岗位", "证人岗位"),
-            ("性别", "证人性别"),
-            ("年龄", "证人年龄"),
-        ]
-        for src, dst in mapping:
-            val = w.get(src, "")
+        """把统一证人记录（英文 schema）同步到扁平 证人* 键（供模板/AI 兼容使用）"""
+        for field in PERSON_BASE_FIELDS:
+            val = w.get(field, "")
             if val:
-                self.set_data(dst, val, 'basic')
+                self.set_data(person_flat_key("证人", field), val, 'basic')
 
     def _sync_form_to_current_witness(self):
         """把表单内容写回当前证人，并同步扁平 证人* 键"""
@@ -3880,13 +3681,7 @@ class MainWindow(QWidget, Ui_Form):
         if w is None:
             return
 
-        w["姓名"] = self.name_pane.text().strip()
-        w["身份证号"] = self.idnumer_pane.text().strip()
-        w["身份证地址"] = self.textEdit.toPlainText().strip()
-        w["手机号"] = self.lineEdit_4.text().strip()
-        w["岗位"] = self.lineEdit_5.text().strip()
-        w["性别"] = self.lineEdit.text().strip()
-        w["年龄"] = self.age_pane.text().strip()
+        w.update(self._read_form_as_person())
 
         self._mirror_witness_to_flat(w)
 
@@ -3894,7 +3689,7 @@ class MainWindow(QWidget, Ui_Form):
         idx = self.data_model.current_witness_index
         if 0 <= idx < self.witness_combo.count():
             self.witness_combo.blockSignals(True)
-            self.witness_combo.setItemText(idx, f"{w.get('序号', '')} · {w.get('姓名') or '未命名'}")
+            self.witness_combo.setItemText(idx, f"{w.get('seq', '')} · {w.get('name') or '未命名'}")
             self.witness_combo.blockSignals(False)
 
         self.var_manager.clear_cache()
@@ -3904,13 +3699,7 @@ class MainWindow(QWidget, Ui_Form):
         w = self._current_witness()
         if w is None:
             return
-        self.name_pane.setText(w.get("姓名", ""))
-        self.idnumer_pane.setText(w.get("身份证号", ""))
-        self.textEdit.setPlainText(w.get("身份证地址", ""))
-        self.lineEdit_4.setText(w.get("手机号", ""))
-        self.lineEdit_5.setText(w.get("岗位", ""))
-        self.lineEdit.setText(w.get("性别", ""))
-        self.age_pane.setText(str(w.get("年龄", "")) if w.get("年龄") else "")
+        self._write_person_to_form(w)
 
         self._mirror_witness_to_flat(w)
         self.var_manager.clear_cache()
@@ -3928,9 +3717,10 @@ class MainWindow(QWidget, Ui_Form):
             return
         new_index = len(self.data_model.witnesses)
         new_witness = {
-            "序号": _witness_label(new_index + 1),
-            "姓名": "", "身份证号": "", "身份证地址": "",
-            "手机号": "", "岗位": "", "性别": "", "年龄": "",
+            "role": "证人",
+            "seq": _witness_label(new_index + 1),
+            "name": "", "gender": "", "age": "",
+            "id_card": "", "address": "", "phone": "", "position": "",
         }
         self.data_model.witnesses.append(new_witness)
         self.data_model.current_witness_index = new_index
@@ -3942,9 +3732,10 @@ class MainWindow(QWidget, Ui_Form):
 
         new_index = len(self.data_model.witnesses)
         new_witness = {
-            "序号": _witness_label(new_index + 1),
-            "姓名": "", "身份证号": "", "身份证地址": "",
-            "手机号": "", "岗位": "", "性别": "", "年龄": "",
+            "role": "证人",
+            "seq": _witness_label(new_index + 1),
+            "name": "", "gender": "", "age": "",
+            "id_card": "", "address": "", "phone": "", "position": "",
         }
         self.data_model.witnesses.append(new_witness)
         self.data_model.current_witness_index = new_index
@@ -3977,22 +3768,6 @@ class MainWindow(QWidget, Ui_Form):
             print(f"✅ 证人信息已保存到案件数据: {len(self.data_model.witnesses)} 位证人")
         except Exception as e:
             print(f"保存证人信息失败: {e}")
-
-    def _load_witnesses(self):
-        """从 cases_data.json 的当前案件读取证人数据"""
-        case_id = (self.current_case_id or '').strip() or self.lineEdit_2.text().strip()
-        if not case_id:
-            return
-        try:
-            case_obj = self._load_cases_data().get(case_id)
-            if case_obj is None:
-                return
-            self.data_model.witnesses = list(case_obj.get('witnesses', []))
-            self.data_model.current_witness_index = -1
-            self._refresh_witness_combo()
-            print(f"✅ 加载证人信息: {len(self.data_model.witnesses)} 位证人")
-        except Exception as e:
-            print(f"加载证人信息失败: {e}")
 
     def setup_logging(self):
         """简化日志系统"""
@@ -4749,37 +4524,19 @@ class MainWindow(QWidget, Ui_Form):
             traceback.print_exc()
 
     def update_role_info(self, role):
-        """更新角色信息"""
+        """按角色把共享表单内容写入兼容扁平键（统一人记录 schema），并处理角色化副作用"""
         try:
             self._save_date_inputs()
-            name = self.name_pane.text().strip()
-            idcard = self.idnumer_pane.text().strip()
-            address = self.textEdit.toPlainText().strip()
-            phone = self.lineEdit_4.text().strip()
-            position = self.lineEdit_5.text().strip()
-
-            data_updates = {
-                f'{role}姓名': name,
-                f'{role}身份证号': idcard,
-                f'{role}身份证地址': address,
-                f'{role}手机号': phone,
-            }
-
-            if role == "法人":
-                data_updates[f'{role}职务'] = position
-            else:
-                data_updates[f'{role}岗位'] = position
-
-            for key, value in data_updates.items():
-                if value:
-                    self.set_data(key, value, 'basic')
+            person = self._read_form_as_person()
+            self._person_to_flat(role, person)
 
             if role == "本人":
                 # 自动生成案本号
                 current_case = self.lineEdit_2.text().strip()
                 if not current_case:
-                    id_card = self.idnumer_pane.text().strip()
-                    case_num = self._auto_generate_case_number(name, id_card)
+                    case_num = self._auto_generate_case_number(
+                        person.get('name', ''), person.get('id_card', '')
+                    )
                     self.lineEdit_2.setText(case_num)
                     self.set_data('案本号', case_num, 'case')
 
@@ -4948,6 +4705,11 @@ class MainWindow(QWidget, Ui_Form):
         self.radioButton.setChecked(True)
         self.clear_role_fields()
         self._apply_case_object(case_obj)
+        # 恢复该案件的证人列表到内存（统一人记录 schema），供后续切换/生成使用
+        self.data_model.witnesses = [dict(w) for w in case_obj.get('witnesses', [])]
+        self.data_model.current_witness_index = -1
+        if hasattr(self, 'witness_combo'):
+            self._refresh_witness_combo()
         self.current_case_id = str(case_obj.get('case_id', ''))
         self._set_status(f"已加载案件：{self.current_case_id}", 'green')
         QMessageBox.information(
